@@ -26,11 +26,22 @@
   var lastSnap = null;
   var prevSnapObj = null;
   // 网络插值：保存最近若干快照及各自本地到达时间（20Hz 服务端下需留足够缓冲）
-  var hist = []; // [{s, t}]
-  var histMax = 14;
+  var hist = []; // [{s, t, ht?}] t=到达时间；ht=主机时间戳（有则优先，时间轴无抖动）
+  var histMax = 20;
   var lastPhase = '';
   var lastPhaseT = -1;
   var inPlay = false;
+
+  /* ---------- 房员端：主机时间戳 → 无抖动渲染时间线 ----------
+   * 主机的快照是按固定节拍产出的，它的 ht 是"等间隔"的；
+   * 而快照经过公共中继后到达时间是忽快忽慢的。
+   * 用 ht 当时间轴 + 一个播放缓冲，就能重建出平滑的对手运动。
+   */
+  var clkSamples = [];   // [{t, obs}] 最近 3 秒的"本机时间 − 主机时间"观测
+  var clkOff = 0;        // 两机时钟偏移（取窗口内最小值 = 最快到达的那条）
+  var clkJitter = 0;     // 窗口内 90 分位的额外延迟 → 播放缓冲要盖住它
+  var clkReady = false;
+  var histClock = '';    // 'host' | 'arrival'：时间轴口径，切换时清空历史
 
   /* ---------- 联机非权威端：自身球本地连续模拟（根治"走一步又弹回"） ----------
    * 原理：权威端与本地用同一套移动公式、同一份输入，只是相差一个网络延迟。
@@ -626,7 +637,7 @@
           showBig(false);
           updateSndBtn();
         }
-        acceptSnapshot(m.s);
+        acceptSnapshot(m.s, m.ht);
         break;
       case 'peerLeft':
         lastSnap = null;
@@ -743,7 +754,21 @@
   /* =========================================================
    *                  快照接入 / HUD / 覆盖
    * ========================================================= */
-  function acceptSnapshot(snap) {
+  // 用主机时间戳估计：两机时钟偏移 + 网络抖动幅度
+  function clockUpdate(now, hostT) {
+    clkSamples.push({ t: now, obs: now - hostT });
+    while (clkSamples.length > 2 && now - clkSamples[0].t > 3000) clkSamples.shift();
+    var n = clkSamples.length;
+    var arr = new Array(n);
+    for (var i = 0; i < n; i++) arr[i] = clkSamples[i].obs;
+    arr.sort(function (a, b) { return a - b; });
+    clkOff = arr[0];
+    var idx = Math.min(n - 1, Math.floor(n * 0.9));
+    clkJitter = Math.max(0, arr[idx] - arr[0]);
+    clkReady = n >= 6;
+  }
+
+  function acceptSnapshot(snap, hostT) {
     var fresh = snap !== prevSnapObj;
     prevSnapObj = snap;
     if (fresh) {
@@ -751,6 +776,17 @@
       for (var i = 0; i < snap.events.length; i++) playEvent(snap.events[i]);
     }
     var now = performance.now();
+
+    // 时间轴口径：能拿到主机时间戳且自己是房员 → 用无抖动的 ht 时间线
+    var useHost = (typeof hostT === 'number' && isFinite(hostT) && !isAuthority());
+    var clockMode = useHost ? 'host' : 'arrival';
+    if (clockMode !== histClock) {
+      histClock = clockMode;
+      hist.length = 0;
+      clkSamples.length = 0;
+      clkReady = false;
+    }
+    if (useHost) clockUpdate(now, hostT);
     // 统计快照到达间隔：用于自适应插值缓冲（网络越抖，缓冲越大）。
     // 同时跟踪"衰减峰值"——缓冲必须能盖住最坏的那次抖动，否则就会冻一帧再跳。
     if (snapArrLast) {
@@ -764,7 +800,9 @@
 
     // 在线模式：压入历史用于插值；练习模式直接用最新
     if (mode === 'online') {
-      hist.push({ s: snap, t: now });
+      var entry = { s: snap, t: now };
+      if (useHost) entry.ht = hostT;
+      hist.push(entry);
       if (hist.length > histMax) hist.shift();
       // 非权威端：用权威快照校准本地自身模拟（延迟对齐 + 温和纠偏，绝不瞬移）
       reconcileOwn(snap);
@@ -781,32 +819,44 @@
   function buildRenderSnap() {
     if (!lastSnap) return null;
     if (hist.length < 2) return lastSnap;
-    // 自适应插值缓冲：以"到达间隔的衰减峰值"为准（而不是均值），
-    // 这样即使网络偶发大抖动，渲染时刻也不会越过最新快照 → 对手不会"冻一下再跳"。
-    // 权威端（房主）快照是本地即时的、几乎无抖动，用最小缓冲即可，避免平白多出一截延迟。
-    var INTERP_MS = isAuthority()
-      ? Math.min(40, snapGapMs * 0.75)
-      : Math.max(90, Math.min(260, snapGapPeak * 1.4 + 25));
-    var targetT = performance.now() - INTERP_MS;
-    // 找 targetT 落在哪两个快照之间（hist 内 t 递增）
+
+    var useHost = (histClock === 'host') && clkReady;
+    var key, targetT;
+    if (useHost) {
+      // —— 无抖动时间线 ——
+      // 主机时间戳 ht 是等间隔的，用它当坐标轴，插值出来的运动天然平滑。
+      // 播放缓冲 = 基础 50ms + 实测抖动（90 分位），刚好盖住网络抖动，不多不少。
+      key = 'ht';
+      var delay = 50 + Math.min(220, clkJitter);
+      targetT = (performance.now() - delay) - clkOff;
+    } else {
+      // 拿不到主机时间戳（老协议/自建服务器）：退回按"到达时间"插值
+      key = 't';
+      var INTERP_MS = isAuthority()
+        ? Math.min(40, snapGapMs * 0.75)
+        : Math.max(90, Math.min(260, snapGapPeak * 1.4 + 25));
+      targetT = performance.now() - INTERP_MS;
+    }
+
+    // 找 targetT 落在哪两个快照之间（hist 内该坐标轴单调递增）
     var a = null, b = null;
     for (var i = hist.length - 1; i >= 0; i--) {
-      if (hist[i].t <= targetT) { a = hist[i]; break; }
+      if (hist[i][key] <= targetT) { a = hist[i]; break; }
     }
     if (!a) { a = hist[0]; b = hist[1]; }
     else {
       // 找 a 之后离 targetT 最近的那个快照
       for (var j = 0; j < hist.length; j++) {
-        if (hist[j].t > a.t) { b = hist[j]; break; }
+        if (hist[j][key] > a[key]) { b = hist[j]; break; }
       }
     }
     // 缓冲用尽（快照还没到）：沿最后已知速度做极短外推，而不是冻在上一帧。
     // 外推上限 80ms，既避免"冻结顿挫"，也不会飘得太远。
-    if (!b) return extrapolateSnap(a.s, targetT - a.t);
-    if (b.t === a.t) return b.s;
-    if (targetT <= a.t) return a.s;
-    if (targetT >= b.t) return extrapolateSnap(b.s, targetT - b.t);
-    var t = (targetT - a.t) / (b.t - a.t);
+    if (!b) return extrapolateSnap(a.s, targetT - a[key]);
+    if (b[key] === a[key]) return b.s;
+    if (targetT <= a[key]) return a.s;
+    if (targetT >= b[key]) return extrapolateSnap(b.s, targetT - b[key]);
+    var t = (targetT - a[key]) / (b[key] - a[key]);
     var s0 = a.s, s1 = b.s; // 两个原始快照
     var out = {
       w: s1.w, h: s1.h, phase: s1.phase, phaseT: s1.phaseT,
@@ -1316,6 +1366,11 @@
     snapArrLast = 0;
     snapGapMs = 50;
     snapGapPeak = 50;
+    clkSamples.length = 0;
+    clkOff = 0;
+    clkJitter = 0;
+    clkReady = false;
+    histClock = '';
     ghostArrows.length = 0;
     ghostSeq = -1;
     ghostFireCd = 0;
