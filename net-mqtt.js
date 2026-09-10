@@ -1,9 +1,7 @@
 /*
  * 球影对决 - MQTT 中继联机（无需自建服务器）
- * 原理：用公共 MQTT 消息代理(broker)转发消息。
- *   - 创建房间者 = host：在本机运行权威引擎，20Hz 广播快照
- *   - 加入者 = guest：只上报输入，接收快照渲染
- * 消息协议与原先 WebSocket 服务器保持一致，便于复用 game.js 逻辑。
+ * host(创建者)：本机运行权威引擎，20Hz 广播快照，并同步驱动本机画面
+ * guest(加入者)：上报输入，接收快照渲染
  */
 (function () {
   'use strict';
@@ -13,7 +11,7 @@
 
   var PREFIX = 'qiuyingduel2026/';
 
-  // 多个公共 broker，按顺序尝试（实测延迟都远低于云沙箱）
+  // 多个公共 broker，按顺序尝试（实测延迟远低于云沙箱）
   var BROKERS = [
     'wss://broker.hivemq.com:8884/mqtt',
     'wss://broker.emqx.io:8084/mqtt',
@@ -44,27 +42,27 @@
     return { k: { w: false, a: false, s: false, d: false }, aim: 0, fire: false, boost: false, snipe: false };
   }
 
-  function pub(topic, obj, retain) {
+  function pub(topic, obj, qos) {
     if (!client) return;
-    try { client.publish(topic, JSON.stringify(obj), { qos: 0, retain: !!retain }); } catch (e) {}
+    try { client.publish(topic, JSON.stringify(obj), { qos: qos || 0, retain: false }); } catch (e) {}
   }
 
-  // 连接 broker（依次尝试），成功后回调
-  function connectBroker(done) {
+  // 连接 broker（依次尝试），will 为掉线遗嘱消息
+  function connectBroker(done, will) {
     var i = 0;
     function attempt() {
       if (i >= BROKERS.length) { status('fail', '所有公共中继都连不上，请稍后重试'); return; }
       var url = BROKERS[i++];
+      var opts = {
+        clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
+        clean: true,
+        reconnectPeriod: 0,
+        connectTimeout: 6000,
+        keepalive: 30
+      };
+      if (will) opts.will = will;
       var c;
-      try {
-        c = mqtt.connect(url, {
-          clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
-          clean: true,
-          reconnectPeriod: 0,
-          connectTimeout: 6000,
-          keepalive: 30
-        });
-      } catch (e) { attempt(); return; }
+      try { c = mqtt.connect(url, opts); } catch (e) { attempt(); return; }
       var settled = false;
       var timer = setTimeout(function () {
         if (settled) return;
@@ -91,14 +89,11 @@
         if (isHost && hostRoom) hostRoom.onGuestMsg(m);
         else if (!isHost && onMessageCb) onMessageCb(m);
       });
-      c.on('close', function () {
-        if (settled && client === c) { status('closed'); }
-      });
     }
     attempt();
   }
 
-  /* ===================== HOST（创建房间者） ===================== */
+  /* ===================== HOST ===================== */
   function HostRoom(code, hostName, onMessage) {
     this.code = code;
     this.names = [hostName, ''];
@@ -111,7 +106,6 @@
     this.guestPresent = false;
     this.inputs = [newInput(), newInput()];
     this.timer = null;
-    this.lastGuest = 0;
   }
 
   HostRoom.prototype.roster = function (forRole) {
@@ -121,10 +115,8 @@
   };
 
   HostRoom.prototype.pushLobby = function () {
-    // 给 host 自己
-    this.onMessage(this.roster(0));
-    // 给 guest
-    if (this.guestPresent) pub(topicOut, this.roster(1));
+    this.onMessage(this.roster(0));               // 本机
+    if (this.guestPresent) pub(topicOut, this.roster(1)); // 对方
   };
 
   HostRoom.prototype.startGame = function () {
@@ -132,16 +124,20 @@
     this.running = true;
     this.onceStarted = true;
     this.inputs = [newInput(), newInput()];
-    pub(topicOut, { t: 'begin', names: this.names.slice() });
+    var begin = { t: 'begin', names: this.names.slice() };
+    this.onMessage(begin); // 本机也要进入对局
+    pub(topicOut, begin);
   };
 
   HostRoom.prototype.onGuestMsg = function (m) {
-    this.lastGuest = Date.now();
     if (m.type === 'join') {
-      if (this.guestPresent) { pub(topicOut, { t: 'error', message: '房间已满' }); return; }
+      // 已有客人：视为重试，重发一次房间信息（解决加入方错过首次 lobby 的问题）
+      if (this.guestPresent && m.name && this.names[1] && m.name !== this.names[1]) {
+        pub(topicOut, { t: 'error', message: '房间已满（每房限 2 人）' });
+        return;
+      }
       this.names[1] = String(m.name || '球手').slice(0, 10);
       this.guestPresent = true;
-      this.guestReady = false;
       this.pushLobby();
       return;
     }
@@ -220,6 +216,8 @@
     }
     Eng.update(this.game, 1 / 20);
     var snap = Eng.snapshot(this.game);
+    // 本机渲染（关键：房主自己也要收到快照）
+    this.onMessage({ t: 'state', s: snap });
     pub(topicOut, { t: 'state', s: snap });
   };
 
@@ -238,51 +236,50 @@
     isHost: function () { return isHost; },
     code: function () { return roomCode; },
 
-    // 创建房间
     create: function (name, onMessage, onStatus) {
       onMessageCb = onMessage; onStatusCb = onStatus;
       isHost = true;
       roomCode = randomCode();
       topicIn = PREFIX + roomCode + '/c2h';
       topicOut = PREFIX + roomCode + '/h2c';
+      var will = { topic: topicOut, payload: JSON.stringify({ t: 'peerLeft', message: '房主已离开房间' }), qos: 0 };
       connectBroker(function (c) {
         c.subscribe(topicIn, function () {});
         hostRoom = new HostRoom(roomCode, name, onMessage);
         hostRoom.run();
         hostRoom.pushLobby();
         onStatus('ready', roomCode);
-      });
+      }, will);
     },
 
-    // 加入房间
     join: function (code, name, onMessage, onStatus) {
       onMessageCb = onMessage; onStatusCb = onStatus;
       isHost = false;
       roomCode = String(code || '').toUpperCase();
       topicIn = PREFIX + roomCode + '/c2h';
       topicOut = PREFIX + roomCode + '/h2c';
+      var will = { topic: topicIn, payload: JSON.stringify({ type: 'leave' }), qos: 0 };
       connectBroker(function (c) {
-        c.subscribe(topicOut, function () {});
         onStatus('ready', roomCode);
-        // 反复发送 join，直到收到 lobby（防止 host 尚未就绪）
-        joinTries = 0;
-        var doJoin = function () {
-          pub(topicIn, { type: 'join', name: name });
-          joinTries++;
-          if (joinTries > 8) { clearInterval(joinTimer); }
-        };
-        doJoin();
-        if (joinTimer) clearInterval(joinTimer);
-        joinTimer = setInterval(doJoin, 1200);
-      });
+        // 关键：等订阅成功后再上报 join，否则会错过房主回的房间信息
+        c.subscribe(topicOut, function () {
+          joinTries = 0;
+          var doJoin = function () {
+            pub(topicIn, { type: 'join', name: name });
+            joinTries++;
+            if (joinTries > 15 && joinTimer) { clearInterval(joinTimer); joinTimer = null; }
+          };
+          doJoin();
+          if (joinTimer) clearInterval(joinTimer);
+          joinTimer = setInterval(doJoin, 1000);
+        });
+      }, will);
     },
 
-    // 收到 host 消息后由 game.js 调用（用于停止重试）
     onLobbyReceived: function () {
       if (joinTimer) { clearInterval(joinTimer); joinTimer = null; }
     },
 
-    // 发送客户端 -> 服务器 消息
     send: function (obj) {
       if (isHost) {
         if (!hostRoom) return;
@@ -297,7 +294,6 @@
         }
         return;
       }
-      // guest
       if (obj.type === 'input') { pub(topicIn, obj); return; }
       if (obj.type === 'ready') { pub(topicIn, { type: 'ready' }); return; }
       if (obj.type === 'leave') {
