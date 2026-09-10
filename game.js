@@ -123,6 +123,29 @@
     boost: function () { tone(280, 900, 0.16, 0.12, 'sine'); noise(0.12, 0.08, 3200); },
     snipe: function () { tone(1400, 2000, 0.08, 0.09, 'square'); noise(0.06, 0.05, 6000); }
   };
+
+  // 房主防后台降频：播放一段极低音量持续音，让浏览器认为页面在发声，
+  // 从而不在后台把定时器降频（否则房主切后台会让对方卡顿）
+  var keepOsc = null, keepGain = null;
+  function startHostKeepAlive() {
+    ensureAudio();
+    if (!AC || keepOsc) return;
+    try {
+      keepGain = AC.createGain();
+      keepGain.gain.value = 0.002; // 极低，基本听不到
+      keepOsc = AC.createOscillator();
+      keepOsc.type = 'sine';
+      keepOsc.frequency.value = 50;
+      keepOsc.connect(keepGain);
+      keepGain.connect(AC.destination);
+      keepOsc.start();
+    } catch (e) { keepOsc = null; }
+  }
+  function stopHostKeepAlive() {
+    if (keepOsc) { try { keepOsc.stop(); } catch (e) {} try { keepOsc.disconnect(); } catch (e) {} keepOsc = null; }
+    if (keepGain) { try { keepGain.disconnect(); } catch (e) {} keepGain = null; }
+  }
+
   function playEvent(ev) {
     if (!ev) return;
     if (ev.t === 'shot') SFX.shot();
@@ -578,12 +601,15 @@
     }
 
     var hint = $('lobbyHint');
+    var hostNote = (netKind === 'mqtt' && window.MQTTNet && window.MQTTNet.isHost())
+      ? '<div class="hostNote">房主模式：对局中请保持本页面在前台（切到其它标签页/最小化会让双方都变卡）</div>'
+      : '';
     if (two) {
-      hint.innerHTML = m.onceStarted
+      hint.innerHTML = (m.onceStarted
         ? '上一局曾被打断。两人到齐后将自动开始新对局。'
-        : '房间号 <b style="letter-spacing:2px">' + m.code + '</b> 已生成。双方都点「准备」即可开战。';
+        : '房间号 <b style="letter-spacing:2px">' + m.code + '</b> 已生成。双方都点「准备」即可开战。') + hostNote;
     } else {
-      hint.innerHTML = '将房间号 <b style="letter-spacing:2px">' + m.code + '</b> 或邀请链接发给朋友。<br/>对方加入后，双方点「准备」即可开战。';
+      hint.innerHTML = '将房间号 <b style="letter-spacing:2px">' + m.code + '</b> 或邀请链接发给朋友。<br/>对方加入后，双方点「准备」即可开战。' + hostNote;
     }
     showScreen('lobby');
   }
@@ -594,6 +620,7 @@
     if (!isLocalHost() && window.MQTTNet) {
       netKind = 'mqtt';
       netTip('正在连接公共中继…', '');
+      startHostKeepAlive(); // 房主：防止切后台被浏览器降频
       window.MQTTNet.create(name, onServerMsg, onNetStatus);
       return;
     }
@@ -621,6 +648,7 @@
     if (netKind === 'mqtt' && window.MQTTNet) {
       if (sendMsg) window.MQTTNet.send({ type: 'leave' });
       window.MQTTNet.close();
+      stopHostKeepAlive();
       netKind = null;
       return;
     }
@@ -1070,6 +1098,18 @@
     updateSndBtn();
     installBackGuard();
     showScreen('menu');
+
+    // 房主切后台会让双方卡：回到前台时提醒
+    var hiddenDuringPlay = false;
+    document.addEventListener('visibilitychange', function () {
+      var isMqttHost = (netKind === 'mqtt' && window.MQTTNet && window.MQTTNet.isHost());
+      if (document.hidden) {
+        if (mode === 'online' && isMqttHost) hiddenDuringPlay = true;
+      } else if (hiddenDuringPlay) {
+        hiddenDuringPlay = false;
+        showToast('检测到房主页面切到后台——这会让双方卡顿，请保持本页在前台', 4200);
+      }
+    });
 
     try { $('nameIn').value = localStorage.getItem('qyj_name') || ''; } catch (e) {}
 
