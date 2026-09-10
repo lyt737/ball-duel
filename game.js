@@ -120,7 +120,8 @@
   function onNetStatus(s, extra) {
     if (s === 'ok') {
       brokerName = String(extra || '').replace(/^wss?:\/\//i, '').split('/')[0].replace(/:\d+$/, '');
-      netTip('公共中继已连接…', 'ok');
+      // 把中继名字显示出来：双方若连到不同中继（互相收不到消息），一眼就能发现
+      netTip('公共中继已连接（' + brokerName + '）…', 'ok');
     }
     else if (s === 'ready') netTip('房间已就绪（中继模式）', 'ok');
     else if (s === 'fail') { netTip(extra || '公共中继连接失败', 'err'); showToast(extra || '连接失败，请重试', 3600); }
@@ -128,6 +129,10 @@
     else if (s === 'lost') { netTip('与中继的连接中断，正在自动重连…', 'err'); showToast('网络中断，正在自动重连…', 4000); }
     else if (s === 'retry') { netTip('正在重连中继…', ''); }
     else if (s === 'back') { netTip('已重新连接中继，可继续对战', 'ok'); showToast('已重新连接，对阵可以继续了', 3000); }
+    else if (s === 'waitjoin') {
+      netTip('已连上中继，但还没收到房间信息…', 'err');
+      showToast('8 秒未收到房间信息：① 确认房间号是否正确 ② 让对方保持页面在前台 ③ 双方中继名字要一致', 6000);
+    }
   }
 
   /* ---------- 网络状态小条：把"卡不卡"变成能看的数字 ----------
@@ -823,8 +828,10 @@
     } else {
       hint.innerHTML = '将房间号 <b style="letter-spacing:2px">' + m.code + '</b> 或邀请链接发给朋友。<br/>对方加入后，双方点「准备」即可开战。' + hostNote;
     }
-    // 关键：对局进行中收到大厅刷新（如对方重试 join）时，绝不能把玩家踢回大厅界面
-    if (!inPlay) showScreen('lobby');
+    // 关键：对局进行中收到大厅刷新（如对方重试 join）时，绝不能把玩家踢回大厅界面。
+    // 反过来，只要还没拿到对局数据（lastSnap 为空），就必须切到房间界面，
+    // 否则会出现"房主看得到我、我却卡在菜单、准备不了"。
+    if (!inPlay || lastSnap === null) showScreen('lobby');
   }
 
   function createRoom() {
