@@ -414,13 +414,15 @@
     return false;
   }
 
-  // 构造本机输入消息；boost 是一次性边沿（发出即复位）
+  // 构造本机输入消息；boost/snipe 为一次性边沿，重复携带几次以防丢包
+  var boostPulse = 0, snipePulse = 0;
   function makeInputMsg() {
     var mv = updateMoveFromKeys();
-    var b = boostRequest;
-    var sn = snipeRequest;
-    boostRequest = false;
-    snipeRequest = false;
+    if (boostRequest) { boostPulse = 3; boostRequest = false; }
+    if (snipeRequest) { snipePulse = 3; snipeRequest = false; }
+    var b = boostPulse > 0, sn = snipePulse > 0;
+    if (boostPulse > 0) boostPulse--;
+    if (snipePulse > 0) snipePulse--;
     return {
       type: 'input',
       k: { w: keys.w, a: keys.a, s: keys.s, d: keys.d },
