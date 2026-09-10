@@ -142,6 +142,9 @@
     this.inputs = [newInput(), newInput()];
     this.timer = null;
     this.mq = []; // 远端移动键的"抖动缓冲"：按到达时间排队，播放时用固定延迟的那一格
+    // 对端输入到达间隔统计（用于给房主显示"对方网络抖不抖"）
+    this.inGapAvg = 33;
+    this.inGapPeak = 33;
   }
 
   HostRoom.prototype.roster = function (forRole) {
@@ -161,6 +164,8 @@
     this.onceStarted = true;
     this.inputs = [newInput(), newInput()];
     this.mq = [];
+    this.inGapAvg = 33;
+    this.inGapPeak = 33;
     var begin = { t: 'begin', names: this.names.slice() };
     this.onMessage(begin); // 本机也要进入对局
     pub(topicOut, begin);
@@ -199,6 +204,14 @@
       // 直接照单全收就会变成房员球的急停急走；缓冲后按固定延迟播放，
       // 输入流变平稳，房主看房员才不会一顿一顿。
       var mqNow = performance.now();
+      var prev = this.mq.length ? this.mq[this.mq.length - 1].t : 0;
+      if (prev) {
+        var ig = mqNow - prev;
+        if (ig > 4 && ig < 800) {
+          this.inGapAvg += (ig - this.inGapAvg) * 0.15;
+          this.inGapPeak = Math.max(ig, this.inGapPeak * 0.94);
+        }
+      }
       this.mq.push({ t: mqNow, w: !!k.w, a: !!k.a, s: !!k.s, d: !!k.d });
       while (this.mq.length > 2 && mqNow - this.mq[0].t > 600) this.mq.shift();
       if (this.mq.length > 80) this.mq.splice(0, this.mq.length - 80);
@@ -252,7 +265,10 @@
       inp.boost = false;
       inp.snipe = false;
       inp.k.w = inp.k.a = inp.k.s = inp.k.d = false;
-      if (i === 1) this.mq.length = 0; // 远端输入抖动缓冲也一并作废
+      if (i === 1) {
+        this.mq.length = 0; // 远端输入抖动缓冲也一并作废
+        this.inGapPeak = Math.max(this.inGapPeak, 400); // 状态条标红：对方卡住/掉线了
+      }
     }
   };
 
@@ -334,6 +350,11 @@
   var api = {
     isHost: function () { return isHost; },
     code: function () { return roomCode; },
+    // 房主用：对端输入到达间隔统计（峰值越大 = 对方网络越抖）
+    stats: function () {
+      if (!isHost || !hostRoom) return null;
+      return { inGapAvg: hostRoom.inGapAvg, inGapPeak: hostRoom.inGapPeak };
+    },
 
     create: function (name, onMessage, onStatus) {
       onMessageCb = onMessage; onStatusCb = onStatus;
