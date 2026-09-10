@@ -198,6 +198,13 @@
   HostRoom.prototype.tick = function () {
     if (!this.running || !this.game) return;
     if (!this.guestPresent) return;
+    // 用"真实经过时间"驱动引擎：定时器被降频/卡顿时，模拟时间仍与真实时间一致，
+    // 不会出现"引擎时间落后于现实"导致的双方状态漂移。
+    var tickNow = performance.now();
+    var tickDt = this.lastTick ? (tickNow - this.lastTick) / 1000 : 1 / 20;
+    this.lastTick = tickNow;
+    if (!(tickDt > 0)) tickDt = 1 / 20;
+    if (tickDt > 0.05) tickDt = 0.05;
     for (var i = 0; i < 2; i++) {
       var k = this.inputs[i].k;
       var dx = (k.d ? 1 : 0) - (k.a ? 1 : 0);
@@ -214,7 +221,7 @@
       this.inputs[i].boost = false;
       this.inputs[i].snipe = false;
     }
-    Eng.update(this.game, 1 / 20);
+    Eng.update(this.game, tickDt);
     var snap = Eng.snapshot(this.game);
     // 本机渲染（关键：房主自己也要收到快照）
     this.onMessage({ t: 'state', s: snap });
@@ -224,7 +231,19 @@
   HostRoom.prototype.run = function () {
     var self = this;
     if (this.timer) clearInterval(this.timer);
-    this.timer = setInterval(function () { self.tick(); }, 50);
+    this.lastTick = 0;
+    this.nextTick = 0;
+    // 漂移补偿调度：以 50ms 为节拍基准（定时器 25ms 轮询，精度刚好对齐），
+    // 避免 setInterval(50) 累积误差越来越大导致广播忽快忽慢。
+    this.timer = setInterval(function () {
+      if (!self.running || !self.game) return;
+      var now = performance.now();
+      if (!self.nextTick) self.nextTick = now;
+      if (now < self.nextTick - 8) return;
+      if (now - self.nextTick > 250) self.nextTick = now; // 落后太多则重新对齐，不爆发补帧
+      self.nextTick += 50;
+      self.tick();
+    }, 25);
   };
 
   HostRoom.prototype.stop = function () {
