@@ -323,17 +323,20 @@
       }
     });
     window.addEventListener('mouseup', function (e) {
-      if (e.button === 0) {
-        fireDown = false;
-        // 松手立即停止
-        pushInputNow();
-      }
+      if (e.button === 0) releaseFire();
     });
+    // 兜底：某些情况（指针在窗口外松开、触摸/触控笔、指针被系统抢走）收不到 mouseup，
+    // 这里用 pointerup / pointercancel / 移出文档 再补几次"松手"，防止开火状态卡死。
+    window.addEventListener('pointerup', function (e) { if (e.button === 0) releaseFire(); });
+    window.addEventListener('pointercancel', releaseFire);
+    document.addEventListener('mouseleave', releaseFire);
     window.addEventListener('blur', function () {
       keys.w = keys.a = keys.s = keys.d = false;
-      fireDown = false;
-      boostHeld = false;
-      snipeRequest = false;
+      resetInputState();
+    });
+    document.addEventListener('visibilitychange', function () {
+      // 切到后台/切标签页：清掉一次性输入，回来后不会"自己一直射"
+      if (document.hidden) resetInputState();
     });
     window.addEventListener('contextmenu', function (e) { e.preventDefault(); });
     window.addEventListener('pointerdown', ensureAudio);
@@ -362,6 +365,7 @@
   function startPractice() {
     if (mode === 'online') leaveOnline(false);
     resetAllFx();
+    resetInputState();
     mode = 'practice';
     role = 0;
     names = [setNameOfInput() + '（你）', '电脑 AI'];
@@ -522,6 +526,26 @@
     netSend(makeInputMsg());
   }
 
+  // 【防自动攻击】清空所有"一次性输入状态"。
+  // 场景：鼠标在窗口外松开时会漏掉 mouseup，导致 fireDown 一直挂着 →
+  // 一进对局球就自己一直射。开局、失焦、切后台时统一清一次。
+  function resetInputState() {
+    fireDown = false;
+    boostHeld = false;
+    boostRequest = false;
+    boostLocalEdge = false;
+    snipeRequest = false;
+    boostPulse = 0;
+    snipePulse = 0;
+  }
+
+  // 松开开火（多个事件源共用：mouseup / pointerup / 指针取消 / 移出窗口）
+  function releaseFire() {
+    if (!fireDown) return;
+    fireDown = false;
+    pushInputNow();
+  }
+
   // 本地开火反馈：枪口立刻冒火光（箭本体由 stepGhostArrows 的乐观箭负责）
   // 仅用于联机模式（练习模式由本机引擎即时处理，无需补偿）
   function localShotFeedback() {
@@ -624,6 +648,8 @@
         break;
       case 'begin':
         if (m.names) names = m.names.slice();
+        // 开局先把一次性输入清干净，避免上一局的按键状态残留成"自动攻击"
+        resetInputState();
         if (netKind === 'mqtt' && window.MQTTNet) window.MQTTNet.onLobbyReceived();
         break;
       case 'state':
