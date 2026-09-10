@@ -96,8 +96,10 @@
 
   <script src="engine.js"></script>
   <script src="render.js"></script>
-  <!-- 公共中继联机（静态部署时使用，无需自建服务器） -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+  <!-- 公共中继联机：mqtt.js 已放到本站同源目录。
+       之前用的是国外 CDN（cdnjs），国内经常卡住/连不上，
+       而它是阻塞脚本，会连带让 net-mqtt.js / game.js 都加载不了 → 页面按钮全失效。 -->
+  <script src="mqtt.min.js"></script>
   <script src="net-mqtt.js"></script>
   <script src="game.js"></script>
 </body>
