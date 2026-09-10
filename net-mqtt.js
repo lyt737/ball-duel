@@ -138,7 +138,7 @@
       }
       this.names[1] = String(m.name || '球手').slice(0, 10);
       this.guestPresent = true;
-      this.pushLobby();
+      if (!this.running) this.pushLobby(); // 对局中不再打扰
       return;
     }
     if (!this.guestPresent) return;
