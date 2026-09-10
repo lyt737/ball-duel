@@ -109,10 +109,44 @@
   }
 
   // 公共中继状态回调
+  var brokerName = '';   // 当前实际连上的中继（显示在对局左上角，方便判断走的是哪条线路）
   function onNetStatus(s, extra) {
-    if (s === 'ok') netTip('公共中继已连接…', 'ok');
+    if (s === 'ok') {
+      brokerName = String(extra || '').replace(/^wss?:\/\//i, '').split('/')[0].replace(/:\d+$/, '');
+      netTip('公共中继已连接…', 'ok');
+    }
     else if (s === 'ready') netTip('房间已就绪（中继模式）', 'ok');
     else if (s === 'fail') { netTip(extra || '公共中继连接失败', 'err'); showToast(extra || '连接失败，请重试', 3600); }
+  }
+
+  /* ---------- 网络状态小条：把"卡不卡"变成能看的数字 ----------
+   * 抖动 = 快照/输入到达时间的忽快忽慢程度，是"一卡一跳"的直接原因。
+   * 抖动越小越顺；一般 <50ms 很顺，50~120ms 能玩，>120ms 会明显飘。 */
+  var netStatT = 0;
+  function updateNetStat(now) {
+    if (now - netStatT < 500) return;
+    netStatT = now;
+    var el = $('netStat');
+    if (!el) return;
+    if (mode !== 'online' || !inPlay) { el.style.display = 'none'; return; }
+    el.style.display = '';
+
+    var prefix = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + ' · ' : '';
+
+    if (isAuthority()) {
+      // 房主：衡量"对方输入到达的抖动"，越大说明对方网络越抖
+      var st = (window.MQTTNet && window.MQTTNet.stats) ? window.MQTTNet.stats() : null;
+      var j = st ? Math.round(st.inGapPeak) : 0;
+      el.className = 'netStat ' + (j < 60 ? 'ok' : (j < 140 ? 'mid' : 'bad'));
+      el.textContent = prefix + '房主 · 对方抖动 ' + j + 'ms';
+    } else if (!clkReady) {
+      el.className = 'netStat mid';
+      el.textContent = prefix + '测量中…';
+    } else {
+      var jj = Math.round(clkJitter);
+      el.className = 'netStat ' + (jj < 50 ? 'ok' : (jj < 120 ? 'mid' : 'bad'));
+      el.textContent = prefix + '抖动 ' + jj + 'ms';
+    }
   }
 
   /* =========================================================
@@ -1312,6 +1346,8 @@
     requestAnimationFrame(frame);
     var dt = Math.min(0.05, lastT ? (now - lastT) / 1000 : 0);
     lastT = now;
+
+    updateNetStat(now);
 
     // 上报输入用 30Hz（33ms）：权威端更快知道你按了什么，对手看你才不"慢半拍"
     if (mode === 'online' && inPlay && netKind === 'mqtt' && now - lastSendT > 33) {
