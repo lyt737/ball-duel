@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>球影对决 - 双人弓箭对决</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%23ef4444'/><circle cx='34' cy='38' r='7' fill='white'/><circle cx='36' cy='39' r='3.5' fill='%231e293b'/><circle cx='66' cy='38' r='7' fill='white'/><circle cx='64' cy='39' r='3.5' fill='%231e293b'/></svg>" />
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <!-- ============ 游戏内 HUD ============ -->
+  <div id="hud" class="hidden">
+    <div class="score" id="scoreEl">
+      <span class="red" id="scoreRed">0</span>
+      <span class="colon">:</span>
+      <span class="blue" id="scoreBlue">0</span>
+      <span class="round" id="roundEl"></span>
+    </div>
+
+    <div class="pcard left" id="pcard0">
+      <div class="pmeta"><span class="dot"></span><span class="pname" id="pname0"></span></div>
+      <div class="hpbar"><div class="hpfill" id="hpfill0"></div></div>
+      <div class="quiver" id="quiver0"></div>
+      <div class="statusline"><span class="boosttag" id="boost0"></span><span class="snipetag" id="snipe0"></span></div>
+    </div>
+    <div class="pcard right" id="pcard1">
+      <div class="pmeta"><span class="dot"></span><span class="pname" id="pname1"></span></div>
+      <div class="hpbar"><div class="hpfill" id="hpfill1"></div></div>
+      <div class="quiver" id="quiver1"></div>
+      <div class="statusline"><span class="snipetag" id="snipe1"></span><span class="boosttag" id="boost1"></span></div>
+    </div>
+
+    <button id="btnQuit" class="topbtn quit" title="离开对局">退出</button>
+    <button id="btnSnd" class="topbtn" title="开关音效">音效</button>
+    <div class="aimTip">WASD 移动 · Shift 冲刺 · 鼠标瞄准 · 左键射箭 · 右键必杀</div>
+  </div>
+
+  <!-- ============ 中央提示 ============ -->
+  <div id="centerWrap">
+    <div id="countdown" class="big hidden"></div>
+    <div id="banner" class="banner hidden"></div>
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <!-- ============ 主菜单 ============ -->
+  <div id="menu" class="screen">
+    <div class="panel">
+      <h1>球影<span class="hl">对决</span></h1>
+      <p class="sub">两个球 · 一张弓 · 先赢 5 局者胜</p>
+
+      <div class="field-row">
+        <label class="field"><span>昵称</span><input id="nameIn" maxlength="10" placeholder="神秘球手" /></label>
+      </div>
+
+      <button id="btnPractice" class="primary">本地练习 · 人机对练</button>
+
+      <div class="divider"><span>在线联机 · 房间号</span></div>
+
+      <button id="btnCreate" class="accent">创建房间（生成房间号）</button>
+      <div class="joinRow">
+        <input id="roomIn" maxlength="5" placeholder="输入房间号" autocapitalize="characters" autocomplete="off" />
+        <button id="btnJoin">加入房间</button>
+      </div>
+
+      <div id="netTip" class="netTip"></div>
+
+      <div class="help">
+        <b>操作说明</b><br />
+        <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 或方向键 —— 移动闪避（摇杆）<br />
+        <kbd>Shift</kbd> 或<kbd>空格</kbd> —— 短暂冲刺（漂移，冷却 3 秒）<br />
+        鼠标 —— 瞄准　按住<kbd>左键</kbd> —— 连续射箭<br />
+        <kbd>右键</kbd> —— 射出一发极快的<b>必杀箭</b>（命中即击倒，冷却 3 秒）<br />
+        箭壶共 <b>5</b> 支，打空后需 2 秒一次性装填；命中 <b>5</b> 箭击倒对方（血条=5 发伤害）。
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 房间大厅（创建/加入后） ============ -->
+  <div id="lobby" class="screen hidden">
+    <div class="panel wide">
+      <div class="roomHead">
+        <div>
+          <h2>房间号</h2>
+          <div class="roomCode" id="roomCode">-----</div>
+        </div>
+        <button id="btnCopyLink" class="secondary">复制邀请链接</button>
+      </div>
+      <div id="roster" class="roster"></div>
+      <div id="lobbyHint" class="lobbyHint">把房间号或链接发给朋友，两位到齐并准备后即可开战。</div>
+      <button id="btnReady" class="primary big">准备</button>
+      <button id="btnLeaveLobby" class="ghost">返回菜单</button>
+    </div>
+  </div>
+
+  <script src="engine.js"></script>
+  <script src="render.js"></script>
+  <!-- 公共中继联机（静态部署时使用，无需自建服务器） -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+  <script src="net-mqtt.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
