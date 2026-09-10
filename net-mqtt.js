@@ -53,50 +53,78 @@
     try { client.publish(topic, JSON.stringify(obj), { qos: qos || 0, retain: false }); } catch (e) {}
   }
 
-  // 连接 broker（依次尝试），will 为掉线遗嘱消息
+  // 连接 broker：三个候选中继"同时抢跑"，谁先连上就用谁，其余立即关掉。
+  // 比原来"逐个等超时"快得多（原来最坏要等 3×7 秒，这就是"加入时间很长"的原因）。
+  // will 为掉线遗嘱消息。
   function connectBroker(done, will) {
-    var i = 0;
-    function attempt() {
-      if (i >= BROKERS.length) { status('fail', '所有公共中继都连不上，请稍后重试'); return; }
-      var url = BROKERS[i++];
-      var opts = {
-        clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
-        clean: true,
-        reconnectPeriod: 0,
-        connectTimeout: 6000,
-        keepalive: 30
-      };
-      if (will) opts.will = will;
-      var c;
-      try { c = mqtt.connect(url, opts); } catch (e) { attempt(); return; }
-      var settled = false;
-      var timer = setTimeout(function () {
-        if (settled) return;
-        settled = true;
-        try { c.end(true); } catch (e) {}
-        attempt();
-      }, 7000);
-      c.on('connect', function () {
-        if (settled) return;
-        settled = true; clearTimeout(timer);
-        client = c;
-        status('ok', url);
-        done(c);
-      });
-      c.on('error', function () {
-        if (settled) return;
-        settled = true; clearTimeout(timer);
-        try { c.end(true); } catch (e) {}
-        attempt();
-      });
-      c.on('message', function (topic, payload) {
-        var m;
-        try { m = JSON.parse(payload.toString()); } catch (e) { return; }
-        if (isHost && hostRoom) hostRoom.onGuestMsg(m);
-        else if (!isHost && onMessageCb) onMessageCb(m);
-      });
+    if (typeof mqtt === 'undefined' || !mqtt || !mqtt.connect) {
+      status('fail', '中继组件未加载（页面可能没加载完），请刷新后重试');
+      return;
     }
-    attempt();
+    var settled = false;
+    var failed = 0;
+    var clients = [];
+
+    function allFailed() {
+      failed++;
+      if (!settled && failed >= BROKERS.length) {
+        settled = true;
+        status('fail', '所有公共中继都连不上，请检查网络后重试');
+      }
+    }
+    function win(c, url) {
+      if (settled) return;
+      settled = true;
+      for (var k = 0; k < clients.length; k++) {
+        if (clients[k] === c) continue;
+        // 用优雅断开：避免触发已注册的遗嘱消息，把对方误判成"已离开"
+        try { clients[k].end(false); } catch (e) {}
+      }
+      client = c;
+      status('ok', url);
+      done(c);
+    }
+
+    for (var i = 0; i < BROKERS.length; i++) {
+      (function (url) {
+        var opts = {
+          clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
+          clean: true,
+          reconnectPeriod: 0,
+          connectTimeout: 5000,
+          keepalive: 30
+        };
+        if (will) opts.will = will;
+        var c;
+        try { c = mqtt.connect(url, opts); } catch (e) { allFailed(); return; }
+        clients.push(c);
+        var doneFlag = false;
+        var timer = setTimeout(function () {
+          if (doneFlag) return;
+          doneFlag = true;
+          try { c.end(true); } catch (e) {} // 未连上过 → 没有遗嘱，可强制关
+          allFailed();
+        }, 6000);
+        c.on('connect', function () {
+          if (doneFlag) return;
+          doneFlag = true; clearTimeout(timer);
+          win(c, url);
+        });
+        c.on('error', function () {
+          if (doneFlag) return;
+          doneFlag = true; clearTimeout(timer);
+          try { c.end(true); } catch (e) {}
+          allFailed();
+        });
+        c.on('message', function (topic, payload) {
+          if (c !== client) return; // 落选的连接不处理消息，避免重复
+          var m;
+          try { m = JSON.parse(payload.toString()); } catch (e) { return; }
+          if (isHost && hostRoom) hostRoom.onGuestMsg(m);
+          else if (!isHost && onMessageCb) onMessageCb(m);
+        });
+      })(BROKERS[i]);
+    }
   }
 
   /* ===================== HOST ===================== */
