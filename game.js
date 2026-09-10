@@ -27,18 +27,50 @@
   var prevSnapObj = null;
   // 网络插值：保存最近若干快照及各自本地到达时间（20Hz 服务端下需留足够缓冲）
   var hist = []; // [{s, t}]
-  var histMax = 6;
+  var histMax = 14;
   var lastPhase = '';
   var lastPhaseT = -1;
   var inPlay = false;
 
+  /* ---------- 联机非权威端：自身球本地连续模拟（根治"走一步又弹回"） ----------
+   * 原理：权威端与本地用同一套移动公式、同一份输入，只是相差一个网络延迟。
+   * 所以本地可以逐帧自己推进（零延迟、绝对平滑），只在收到快照时：
+   *   1) 先做"延迟对齐"——把服务端位置对到本地轨迹的过去某一时刻；
+   *   2) 只对"真实漂移"做限速纠偏，绝不瞬移（只有传送/回合重置才硬对齐）。
+   */
+  var ownSim = null;              // {x,y,vx,vy,boostT,boostCd} 逐帧推进的自身球
+  var ownHist = [];               // [{t,x,y,ax,ay}] 原始轨迹 + 记录当时的累计纠偏量
+  var OWN_HIST_MS = 1600;         // 轨迹回溯窗口
+  var lagEst = 0.10;              // 服务端快照相对"本机此刻"的滞后估计（秒）
+  var appliedX = 0, appliedY = 0; // 已施加的累计纠偏量
+  var driftX = 0, driftY = 0;     // 待逐帧缓慢消化的漂移
+  var snapArrLast = 0;            // 上一个快照到达时刻
+  var snapGapMs = 50;             // 平滑后的快照到达间隔（ms）
+  var ghostArrows = [];           // 本地乐观箭矢（视觉，权威箭出现后退役）
+  var ghostSeq = -1;
+  var ghostFireCd = 0;            // 本地乐观箭的连发节奏
+  var ownArrowSeen = {};          // 已见过的"自己的权威箭" id
+  var ownArrowSeenN = 0;
+
   var keys = { w: false, a: false, s: false, d: false };
   var fireDown = false;
-  var boostHeld = false;   // 冲刺键是否按住
-  var boostRequest = false;// 需要上报一次的冲刺（边沿）
-  var snipeRequest = false;// 需要上报一次的右键秒杀箭（边沿）
-  var localBoostRemain = 0; // 联机本地"预测冲刺"剩余时间（视觉补偿，等服务器快照跟上）
+  var boostHeld = false;     // 冲刺键是否按住
+  var boostRequest = false;  // 需要上报一次的冲刺（边沿，发给权威端）
+  var boostLocalEdge = false;// 需要被本地自身模拟消费一次的冲刺（边沿）
+  var snipeRequest = false;  // 需要上报一次的右键秒杀箭（边沿）
   var mouseCss = { x: 0, y: 0, has: false };
+
+  // 是否为"权威端"：房主（MQTT 模式）本地跑引擎，画面零延迟，无需预测。
+  // 自建服务器（WS）为服务端权威，两端都算非权威，都需要预测。
+  function isAuthority() {
+    if (netKind === 'mqtt') return !!(window.MQTTNet && window.MQTTNet.isHost());
+    return false;
+  }
+  // 与引擎一致的 approach
+  function approachN(cur, target, maxDelta) {
+    if (cur < target) return Math.min(cur + maxDelta, target);
+    return Math.max(cur - maxDelta, target);
+  }
 
   var practiceGame = null;
   var practiceTime = 0;
@@ -240,7 +272,8 @@
         e.preventDefault();
         if (e.repeat || boostHeld) return;
         boostHeld = true;
-        boostRequest = true; // 单次触发：下一帧上报给服务器
+        boostRequest = true; // 单次触发：下一帧上报给权威端
+        if (mode === 'online') boostLocalEdge = true; // 本地模拟立即消费一次
         localBoostFeedback();
         return;
       }
@@ -303,8 +336,9 @@
   }
   function aimAngle() {
     var p = lastSnap ? lastSnap.players[role] : null;
-    var bx = p ? p.x : C.W * 0.2;
-    var by = p ? p.y : C.H * 0.5;
+    // 瞄准起点优先用"本地实际显示位置"，否则鼠标方向会和自己看到的球错位
+    var bx = ownSim ? ownSim.x : (p ? p.x : C.W * 0.2);
+    var by = ownSim ? ownSim.y : (p ? p.y : C.H * 0.5);
     if (!mouseCss.has) return p ? p.aim : 0;
     var w = R.toWorld(mouseCss.x, mouseCss.y);
     return Math.atan2(w.y - by, w.x - bx);
@@ -476,19 +510,63 @@
     netSend(makeInputMsg());
   }
 
-  // 本地开火反馈：球按当前位置向前喷一小撮火光，箭飞行本体仍以服务器权威为准
-  // 仅用于联机模式（练习模式引擎本机即时，无需补偿）
+  // 本地开火反馈：枪口立刻冒火光（箭本体由 stepGhostArrows 的乐观箭负责）
+  // 仅用于联机模式（练习模式由本机引擎即时处理，无需补偿）
   function localShotFeedback() {
-    if (mode !== 'online') return;
+    if (mode !== 'online' || isAuthority()) return;
     var base = lastSnap;
     if (!base || !inPlay) return;
-    if (base.phase !== 'playing') return; // 开局倒计时阶段不开火
     var me = base.players[role];
-    if (!me || me.quiver <= 0) return;    // 没箭不冒火
+    if (!me) return;
+    var src = ownSim || me;
     var aim = aimAngle();
-    var ox = me.x + Math.cos(aim) * (C.BALL_R + 26);
-    var oy = me.y + Math.sin(aim) * (C.BALL_R + 26);
+    var ox = src.x + Math.cos(aim) * (C.BALL_R + 22);
+    var oy = src.y + Math.sin(aim) * (C.BALL_R + 22);
     R.localMuzzle(ox, oy, aim, role);
+  }
+
+  // 本地乐观箭矢：按下的瞬间就能看到自己的箭飞出去，不必等一个网络往返
+  function spawnGhostArrow(bx, by, aim, me) {
+    if (!me || me.quiver <= 0 || me.reloading) return; // 没箭/装弹中不产生虚影
+    ghostArrows.push({
+      id: ghostSeq--, // 负数 id，绝不会与权威箭冲突
+      x: bx + Math.cos(aim) * (C.BALL_R + 22),
+      y: by + Math.sin(aim) * (C.BALL_R + 22),
+      vx: Math.cos(aim) * C.ARROW_SPEED,
+      vy: Math.sin(aim) * C.ARROW_SPEED,
+      owner: role, life: 1.1, kill: false
+    });
+    while (ghostArrows.length > 8) ghostArrows.shift();
+  }
+
+  // 推进本地乐观箭矢；按住连发时按本地射速持续补齐；
+  // 权威箭一出现就退役一个虚影（retireGhosts），避免重影。
+  function stepGhostArrows(dt) {
+    if (mode !== 'online' || isAuthority() || !inPlay) {
+      ghostArrows.length = 0;
+      ghostFireCd = 0;
+      return;
+    }
+    ghostFireCd = Math.max(0, ghostFireCd - dt);
+    var base = lastSnap;
+    if (fireDown && base && base.phase === 'playing' && ghostFireCd <= 0) {
+      var me = base.players[role];
+      if (me && me.quiver > 0 && !me.reloading) {
+        var aim = aimAngle();
+        var src = ownSim || me;
+        spawnGhostArrow(src.x, src.y, aim, me);
+        ghostFireCd = C.FIRE_CD;
+      }
+    }
+    for (var i = ghostArrows.length - 1; i >= 0; i--) {
+      var g = ghostArrows[i];
+      g.x += g.vx * dt;
+      g.y += g.vy * dt;
+      g.life -= dt;
+      if (g.life <= 0 || g.x < -80 || g.x > C.W + 80 || g.y < -80 || g.y > C.H + 80) {
+        ghostArrows.splice(i, 1);
+      }
+    }
   }
 
   // 本地冲刺反馈：短促音效 + 预测冲刺视觉，让联机下冲刺"即按即冲"
@@ -497,7 +575,7 @@
     var base = lastSnap;
     if (base && base.players[role] && base.players[role].boostCd > 0) return; // 冷却中不生效
     SFX.boost();
-    if (mode === 'online') localBoostRemain = C.BOOST_TIME;
+    // 联机下"即按即冲"由本地自身模拟（ownSim）通过 boostLocalEdge 直接体现，无需额外补偿
   }
 
   // 右键秒杀箭：立即给一个"破空"反馈（弹体/致死仍以服务器权威为准）
@@ -553,6 +631,7 @@
         lastSnap = null;
         prevSnapObj = null;
         hist.length = 0;
+        resetNetPrediction();
         lastPhase = '';
         showBig(false);
         showBanner(false);
@@ -670,10 +749,21 @@
       R.processEvents(snap.events);
       for (var i = 0; i < snap.events.length; i++) playEvent(snap.events[i]);
     }
+    var now = performance.now();
+    // 统计快照到达间隔：用于自适应插值缓冲（网络越抖，缓冲越大）
+    if (snapArrLast) {
+      var gap = now - snapArrLast;
+      if (gap > 5 && gap < 600) snapGapMs += (gap - snapGapMs) * 0.2;
+    }
+    snapArrLast = now;
+
     // 在线模式：压入历史用于插值；练习模式直接用最新
     if (mode === 'online') {
-      hist.push({ s: snap, t: performance.now() });
+      hist.push({ s: snap, t: now });
       if (hist.length > histMax) hist.shift();
+      // 非权威端：用权威快照校准本地自身模拟（延迟对齐 + 温和纠偏，绝不瞬移）
+      reconcileOwn(snap);
+      retireGhosts(snap);
     } else {
       hist.length = 0;
     }
@@ -686,8 +776,9 @@
   function buildRenderSnap() {
     if (!lastSnap) return null;
     if (hist.length < 2) return lastSnap;
-    // 渲染时刻留一点缓冲，保证能落在历史区间内
-    var INTERP_MS = 90;
+    // 自适应插值缓冲：按实测快照到达间隔放大（2.4 倍），并限制在 110~260ms。
+    // 缓冲足够大，渲染时刻才不会越过最新快照 → 对手/箭矢不再"冻结后又跳一下"。
+    var INTERP_MS = Math.max(110, Math.min(260, snapGapMs * 2.4));
     var targetT = performance.now() - INTERP_MS;
     // 找 targetT 落在哪两个快照之间（hist 内 t 递增）
     var a = null, b = null;
@@ -727,9 +818,13 @@
         snipeCd: pbn.snipeCd
       });
     }
-    // 箭矢按 id 匹配，找不到的（新生）用较新快照的位置
+    // 箭矢：按 id 取"并集"插值
+    // 旧快照里有、新快照里没有的箭（刚命中/出界被销毁）在本窗口内仍按旧位置续画，
+    // 避免"刚射出的箭在插值窗口内提前消失"。
+    var seen = {};
     for (var ai = 0; ai < s1.arrows.length; ai++) {
       var ab = s1.arrows[ai];
+      seen[ab.id] = 1;
       var found = null;
       for (var aj = 0; aj < s0.arrows.length; aj++) {
         if (s0.arrows[aj].id === ab.id) { found = s0.arrows[aj]; break; }
@@ -746,6 +841,11 @@
         out.arrows.push({ x: ab.x, y: ab.y, vx: ab.vx, vy: ab.vy, owner: ab.owner, id: ab.id, kill: !!ab.kill });
       }
     }
+    for (var ao = 0; ao < s0.arrows.length; ao++) {
+      var aa = s0.arrows[ao];
+      if (seen[aa.id]) continue;
+      out.arrows.push({ x: aa.x, y: aa.y, vx: aa.vx, vy: aa.vy, owner: aa.owner, id: aa.id, kill: !!aa.kill });
+    }
     return out;
   }
   // 角度线性插值（处理 -π / π 环绕）
@@ -756,49 +856,192 @@
     return a + d;
   }
 
-  // 自身预测：基于最新服务端快照 + 本地输入，预测 dt 秒后的状态
-  // optBoost: 本地即时冲刺剩余时间（在服务器确认前先表现为冲刺，随后由快照校准）
-  function predictLocalPlayer(snap, mv, aim, dt, optBoost) {
-    if (!snap || dt <= 0) return snap ? snap.players[role] : null;
-    var src = snap.players[role];
-    var bt = (optBoost !== undefined && optBoost > 0) ? optBoost : (src.boostT || 0);
-    var p = {
-      x: src.x, y: src.y, vx: src.vx, vy: src.vy,
-      hp: src.hp, aim: aim, quiver: src.quiver, fireCd: src.fireCd,
-      reloading: src.reloading, reloadT: src.reloadT,
-      boostT: bt, boostCd: src.boostCd || 0,
-      snipeCd: src.snipeCd || 0
-    };
-    // 与引擎一致的 approach(...)
-    function approach(cur, target, maxDelta) {
-      if (cur < target) return Math.min(cur + maxDelta, target);
-      return Math.max(cur - maxDelta, target);
-    }
-    // 本地冲刺刚触发时，也瞬间提速，与引擎保持一致手感
-    if (optBoost !== undefined && optBoost > 0) {
-      var bdx = mv.dx, bdy = mv.dy;
-      var blen = Math.hypot(bdx, bdy);
-      if (blen < 0.01) {
-        var s0 = Math.hypot(src.vx, src.vy);
-        if (s0 > 20) { bdx = src.vx / s0; bdy = src.vy / s0; }
-        else { bdx = Math.cos(aim); bdy = Math.sin(aim); }
+  /* =========================================================
+   *    非权威端：自身球本地模拟 + 延迟对齐纠偏（根治"走一步又弹回"）
+   * ========================================================= */
+
+  // 在轨迹历史里按时间取位置（线性插值）
+  function ownHistPos(tMs) {
+    if (!ownHist.length) return null;
+    if (tMs <= ownHist[0].t) return ownHist[0];
+    var last = ownHist[ownHist.length - 1];
+    if (tMs >= last.t) return last;
+    for (var i = ownHist.length - 1; i >= 0; i--) {
+      if (ownHist[i].t <= tMs) {
+        var a = ownHist[i];
+        var b = ownHist[i + 1] || last;
+        var span = b.t - a.t;
+        if (span <= 0) return a;
+        var k = (tMs - a.t) / span;
+        return {
+          x: a.x + (b.x - a.x) * k,
+          y: a.y + (b.y - a.y) * k,
+          ax: a.ax + (b.ax - a.ax) * k,
+          ay: a.ay + (b.ay - a.ay) * k
+        };
       }
-      var bm = C.SPEED * C.BOOST_MULT;
-      p.vx = bdx * bm;
-      p.vy = bdy * bm;
-    } else {
-      var mult = bt > 0 ? C.BOOST_MULT : 1; // 冲刺剩余期间速度倍率
-      p.vx = approach(p.vx, mv.dx * C.SPEED * mult, C.ACCEL * dt);
-      p.vy = approach(p.vy, mv.dy * C.SPEED * mult, C.ACCEL * dt);
     }
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
+    return last;
+  }
+
+  // 每帧推进自身球：与引擎 simulate() 的移动部分 1:1 一致
+  function stepOwnSim(dt) {
+    if (mode !== 'online' || !inPlay || isAuthority() || role == null || !ownSim) return;
+    if (dt <= 0) return;
+    if (dt > 0.05) dt = 0.05;
+    // 倒计时/结算阶段球不动（由 reconcileOwn 对齐到出生点），不参与积分
+    if (lastSnap && lastSnap.phase !== 'playing') return;
+
+    var mv = updateMoveFromKeys();
+    var aim = aimAngle();
+
+    // 冲刺：冷却/持续时间推进；本地边沿即时触发（与引擎规则一致）
+    ownSim.boostCd = Math.max(0, ownSim.boostCd - dt);
+    ownSim.boostT = Math.max(0, ownSim.boostT - dt);
+    if (boostLocalEdge) {
+      boostLocalEdge = false;
+      if (ownSim.boostCd <= 0 && ownSim.boostT <= 0) {
+        var bdx = mv.dx, bdy = mv.dy;
+        var blen = Math.sqrt(bdx * bdx + bdy * bdy);
+        if (blen < 0.01) {
+          var sp0 = Math.sqrt(ownSim.vx * ownSim.vx + ownSim.vy * ownSim.vy);
+          if (sp0 > 20) { bdx = ownSim.vx / sp0; bdy = ownSim.vy / sp0; }
+          else { bdx = Math.cos(aim); bdy = Math.sin(aim); }
+        }
+        var bm = C.SPEED * C.BOOST_MULT;
+        ownSim.vx = bdx * bm;
+        ownSim.vy = bdy * bm;
+        ownSim.boostT = C.BOOST_TIME;
+        ownSim.boostCd = C.BOOST_CD;
+      }
+    }
+
+    // 位移（带惯性；冲刺期间速度乘倍率）
+    var mult = ownSim.boostT > 0 ? C.BOOST_MULT : 1;
+    ownSim.vx = approachN(ownSim.vx, mv.dx * C.SPEED * mult, C.ACCEL * dt);
+    ownSim.vy = approachN(ownSim.vy, mv.dy * C.SPEED * mult, C.ACCEL * dt);
+    ownSim.x += ownSim.vx * dt;
+    ownSim.y += ownSim.vy * dt;
+
+    // 消化漂移：限速纠偏（每秒最多 320 世界单位）——只做"缓慢拉回"，绝不瞬移
+    if (driftX || driftY) {
+      var dm = Math.sqrt(driftX * driftX + driftY * driftY);
+      if (dm <= 5) { driftX = 0; driftY = 0; }
+      else {
+        var step = Math.min(dm, 320 * dt);
+        var sx = driftX / dm * step, sy = driftY / dm * step;
+        ownSim.x += sx; ownSim.y += sy;
+        appliedX += sx; appliedY += sy;
+        var keep = 1 - step / dm;
+        driftX *= keep; driftY *= keep;
+      }
+    }
+
+    // 边界（与引擎 boundPlayer 一致）
     var r = C.BALL_R;
-    if (p.x < r) p.x = r;
-    if (p.x > C.W - r) p.x = C.W - r;
-    if (p.y < r) p.y = r;
-    if (p.y > C.H - r) p.y = C.H - r;
-    return p;
+    if (ownSim.x < r) ownSim.x = r;
+    if (ownSim.x > C.W - r) ownSim.x = C.W - r;
+    if (ownSim.y < r) ownSim.y = r;
+    if (ownSim.y > C.H - r) ownSim.y = C.H - r;
+
+    // 记录轨迹（供延迟对齐用）
+    var now = performance.now();
+    ownHist.push({ t: now, x: ownSim.x, y: ownSim.y, ax: appliedX, ay: appliedY });
+    while (ownHist.length > 2 && now - ownHist[0].t > OWN_HIST_MS) ownHist.shift();
+    if (ownHist.length > 400) ownHist.splice(0, ownHist.length - 400);
+  }
+
+  // 收到权威快照后校准：① 延迟对齐 ② 只对真实漂移做温和纠偏
+  function reconcileOwn(snap) {
+    if (mode !== 'online' || isAuthority() || role == null) return;
+    var sp = snap.players[role];
+    if (!sp) return;
+    var now = performance.now();
+
+    function hardAlign(p) {
+      ownSim = p;
+      ownHist.length = 0;
+      ownHist.push({ t: now, x: p.x, y: p.y, ax: 0, ay: 0 });
+      appliedX = 0; appliedY = 0; driftX = 0; driftY = 0;
+    }
+
+    // 回合切换/结算/倒计时：球本来就是静止或刚被摆位，直接硬对齐最稳
+    if (snap.phase !== 'playing') {
+      hardAlign({
+        x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy,
+        boostT: sp.boostT || 0, boostCd: sp.boostCd || 0
+      });
+      return;
+    }
+
+    if (!ownSim) {
+      hardAlign({
+        x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy,
+        boostT: sp.boostT || 0, boostCd: sp.boostCd || 0
+      });
+      return;
+    }
+
+    // ① 延迟对齐：找到"服务端位置对应于本地轨迹的哪一时刻"
+    //    只在确实在移动时更新（静止时搜索结果无意义，会把估计带偏）
+    var n = ownHist.length;
+    if (n >= 6) {
+      var h0 = ownHist[n - 8 < 0 ? 0 : n - 8];
+      var h1 = ownHist[n - 1];
+      if (Math.abs(h1.x - h0.x) + Math.abs(h1.y - h0.y) > 10) {
+        var bestLag = lagEst, bestD2 = Infinity;
+        for (var L = 0.02; L <= 0.70; L += 0.02) {
+          var hp = ownHistPos(now - L * 1000);
+          if (!hp) continue;
+          var dx0 = (hp.x + (appliedX - hp.ax)) - sp.x;
+          var dy0 = (hp.y + (appliedY - hp.ay)) - sp.y;
+          var d2 = dx0 * dx0 + dy0 * dy0;
+          if (d2 < bestD2) { bestD2 = d2; bestLag = L; }
+        }
+        // 平滑跟踪 + 限幅，避免网络抖动让延迟估计乱跳
+        var dl = bestLag - lagEst;
+        if (dl > 0.04) dl = 0.04; else if (dl < -0.04) dl = -0.04;
+        lagEst += dl;
+        if (lagEst < 0) lagEst = 0; else if (lagEst > 0.70) lagEst = 0.70;
+      }
+    }
+
+    // ② 真实漂移 = 服务端位置 − 本地轨迹在 (此刻 − 延迟) 的位置
+    var ref = ownHistPos(now - lagEst * 1000);
+    var ex = 0, ey = 0;
+    if (ref) {
+      ex = sp.x - (ref.x + (appliedX - ref.ax));
+      ey = sp.y - (ref.y + (appliedY - ref.ay));
+    }
+    var mag = Math.sqrt(ex * ex + ey * ey);
+
+    // ③ 漂移过大 = 传送/复活/回合重置：唯一允许硬对齐的情况
+    if (mag > 340) {
+      hardAlign({
+        x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy,
+        boostT: sp.boostT || 0, boostCd: sp.boostCd || 0
+      });
+      return;
+    }
+
+    // ④ 通常情形：把漂移交给 stepOwnSim 逐帧缓慢消化
+    driftX = ex; driftY = ey;
+  }
+
+  // 权威箭一出现，就退役一个本地乐观箭（避免重影）
+  function retireGhosts(snap) {
+    if (isAuthority() || !snap.arrows) return;
+    var fresh = 0;
+    for (var i = 0; i < snap.arrows.length; i++) {
+      var a = snap.arrows[i];
+      if (a.owner !== role) continue;
+      if (ownArrowSeen[a.id]) continue;
+      ownArrowSeen[a.id] = 1;
+      ownArrowSeenN++;
+      fresh++;
+    }
+    if (ownArrowSeenN > 400) { ownArrowSeen = {}; ownArrowSeenN = 0; }
+    while (fresh > 0 && ghostArrows.length > 0) { ghostArrows.shift(); fresh--; }
   }
 
   function updateOverlays(snap) {
@@ -950,10 +1193,11 @@
     var dt = Math.min(0.05, lastT ? (now - lastT) / 1000 : 0);
     lastT = now;
 
-    if (mode === 'online' && inPlay && netKind === 'mqtt' && now - lastSendT > 50) {
+    // 上报输入用 30Hz（33ms）：权威端更快知道你按了什么，对手看你才不"慢半拍"
+    if (mode === 'online' && inPlay && netKind === 'mqtt' && now - lastSendT > 33) {
       lastSendT = now;
       netSend(makeInputMsg());
-    } else if (mode === 'online' && inPlay && ws && ws.readyState === 1 && now - lastSendT > 50) {
+    } else if (mode === 'online' && inPlay && ws && ws.readyState === 1 && now - lastSendT > 33) {
       lastSendT = now;
       wsSend(makeInputMsg());
     }
@@ -976,40 +1220,70 @@
       acceptSnapshot(snap);
     }
 
+    // 非权威端：先推进自身球本地模拟（放在渲染前，保证"零延迟手感"）
+    if (mode === 'online') stepOwnSim(dt);
+
     if (lastSnap && inPlay) {
       var w = mouseCss.has ? R.toWorld(mouseCss.x, mouseCss.y) : null;
-      // 联机模式：渲染插值后的快照；自身用本地预测覆盖
       var renderSnap = (mode === 'online') ? buildRenderSnap() : lastSnap;
-      if (renderSnap && mode === 'online' && role != null && renderSnap.players[role]) {
-        var mv = updateMoveFromKeys();
-        var aim = aimAngle();
-        // 本地预测基于最新到达快照，预测到"现在"所需的推进时间
-        var latestArr = hist.length ? hist[hist.length - 1].t : performance.now();
-        var dtPred = Math.min(0.2, (performance.now() - latestArr) / 1000);
-        // 本地冲刺预测补偿：按下后还没等到服务器确认，先用本地剩余时间表现出冲刺
-        var optBoost = localBoostRemain > 0 ? localBoostRemain : undefined;
-        if (localBoostRemain > 0) localBoostRemain = Math.max(0, localBoostRemain - dt);
-        var pred = predictLocalPlayer(lastSnap, mv, aim, dtPred, optBoost);
-        if (pred) {
-          renderSnap = {
+
+      if (renderSnap && mode === 'online') {
+        // 本地乐观箭矢（自己刚射出的箭立刻可见）
+        stepGhostArrows(dt);
+
+        var needOwn = !!(ownSim && role != null && renderSnap.players[role]);
+        if (needOwn || ghostArrows.length) {
+          var rs = {
             w: renderSnap.w, h: renderSnap.h,
             phase: renderSnap.phase, phaseT: renderSnap.phaseT,
             round: renderSnap.round, winner: renderSnap.winner,
             scores: renderSnap.scores,
             players: renderSnap.players.slice(),
-            arrows: renderSnap.arrows, events: renderSnap.events
+            arrows: ghostArrows.length ? renderSnap.arrows.concat(ghostArrows) : renderSnap.arrows,
+            events: renderSnap.events
           };
-          renderSnap.players[role] = pred;
+          // 自身球：直接用本地模拟（零延迟、绝对平滑），血量/弹药仍取权威值
+          if (needOwn) {
+            var baseP = rs.players[role];
+            rs.players[role] = {
+              x: ownSim.x, y: ownSim.y, vx: ownSim.vx, vy: ownSim.vy,
+              hp: baseP.hp,
+              aim: aimAngle(),
+              quiver: baseP.quiver, fireCd: baseP.fireCd,
+              reloading: baseP.reloading, reloadT: baseP.reloadT,
+              boostT: ownSim.boostT, boostCd: ownSim.boostCd,
+              snipeCd: baseP.snipeCd || 0
+            };
+          }
+          renderSnap = rs;
         }
       }
       R.frame(renderSnap, { role: role, aimWorld: w }, dt);
     }
   }
 
+  // 清空"自身球本地模拟/插值/乐观箭"的全部状态（退出房间、重开一局时调用）
+  function resetNetPrediction() {
+    ownSim = null;
+    ownHist.length = 0;
+    appliedX = 0; appliedY = 0;
+    driftX = 0; driftY = 0;
+    lagEst = 0.10;
+    snapArrLast = 0;
+    snapGapMs = 50;
+    ghostArrows.length = 0;
+    ghostSeq = -1;
+    ghostFireCd = 0;
+    ownArrowSeen = {};
+    ownArrowSeenN = 0;
+    boostLocalEdge = false;
+  }
+
   function resetAllFx() {
     prevSnapObj = null;
     lastSnap = null;
     hist.length = 0;
+    resetNetPrediction();
     lastPhase = '';
     lastPhaseT = -1;
     practiceGame = null;
