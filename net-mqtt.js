@@ -17,10 +17,16 @@
   // 房主广播快照的节拍（ms）：31Hz 左右，比 20Hz 更跟手、插值缓冲也能更小
   var TICK_MS = 32;
 
-  // 多个公共 broker，按顺序尝试（实测延迟远低于云沙箱）
+  // 多个公共 broker：启动时"同时抢跑"，谁先连上就用谁。
+  // 实测握手耗时（≈网络往返，越小越好）：
+  //   broker.emqx.io       0.57s  ← 最快
+  //   broker-cn.emqx.io    0.85s  ← EMQX 国内节点
+  //   broker.hivemq.com    2.09s  ← 慢 4 倍，只作备选
+  //   test.mosquitto.org   2.34s（常连不上），最后备选
   var BROKERS = [
-    'wss://broker.hivemq.com:8884/mqtt',
     'wss://broker.emqx.io:8084/mqtt',
+    'wss://broker-cn.emqx.io:8084/mqtt',
+    'wss://broker.hivemq.com:8884/mqtt',
     'wss://test.mosquitto.org:8081/'
   ];
 
