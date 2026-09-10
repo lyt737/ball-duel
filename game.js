@@ -148,8 +148,24 @@
     if (!el) return;
     // 注意：必须写成 'block'。写空字符串 '' 会清掉内联样式，
     // 于是回落到 CSS 里的 display:none，状态条就永远不显示了。
-    if (mode !== 'online' || !inPlay) { el.style.display = 'none'; return; }
+    if (!inPlay || (mode !== 'online' && mode !== 'practice')) { el.style.display = 'none'; return; }
     el.style.display = 'block';
+
+    // 本窗口（0.5 秒）内的帧时统计
+    var avgMs = frameMsN ? frameMsSum / frameMsN : 0;
+    var maxMs = frameMsMax;
+    frameMsSum = 0; frameMsN = 0; frameMsMax = 0;
+
+    // 练习模式（人机对练）完全不涉及网络：只报"本机帧率"，
+    // 这样一眼就能分清卡顿是本机的、还是网络的。
+    if (mode === 'practice') {
+      var fps = avgMs > 0 ? Math.round(1000 / avgMs) : 0;
+      var pcls = maxMs < 24 ? 'ok' : (maxMs < 40 ? 'mid' : 'bad');
+      el.className = 'netStat ' + pcls;
+      el.textContent = '本机帧率 ' + fps + ' · 最慢帧 ' + Math.round(maxMs) + 'ms' +
+        '\n判定：' + (pcls === 'ok' ? '本机流畅' : (pcls === 'mid' ? '偶尔顿一下（轻微）' : '本机卡顿明显'));
+      return;
+    }
 
     var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
     var ex = extrapN; extrapN = 0;   // 每 0.5 秒汇报一次，理想是 0
@@ -1463,14 +1479,19 @@
    *                      主循环
    * ========================================================= */
   var lastT = 0;
-  var acc = 0;
-  var FIXED = 1 / 60;
+  // 帧时统计：用于练习模式的"帧率"读数，把"卡不卡"变成能看的数字
+  var frameMsSum = 0, frameMsN = 0, frameMsMax = 0;
 
   function frame(now) {
     requestAnimationFrame(frame);
     var dt = Math.min(0.05, lastT ? (now - lastT) / 1000 : 0);
     lastT = now;
     frameN++;
+    if (dt > 0) {
+      var fms = dt * 1000;
+      frameMsSum += fms; frameMsN++;
+      if (fms > frameMsMax) frameMsMax = fms;
+    }
 
     updateNetStat(now);
 
@@ -1484,18 +1505,36 @@
     }
 
     if (mode === 'practice' && practiceGame) {
-      acc += dt;
-      if (acc > 0.25) acc = 0.25;
-      var guard = 0;
-      while (acc >= FIXED && guard < 5) {
-        acc -= FIXED;
-        guard++;
+      // 【练习模式"单点卡顿"的根因】
+      // 原来用"固定 1/60 步长 + 累加器"推进物理，要求每帧恰好消费一个步长。
+      // 但 rAF 的时间间隔本身是抖动的：会出现"这帧走两步、下帧一步没走"，
+      // 那一步没走的帧画面完全没变 → 屏幕上一顿一顿；屏幕刷新率不是 60Hz
+      // （90/120/144Hz 笔记本）时步进分布更不均匀，肉眼更明显。
+      //
+      // 现在改成：把这一帧的"真实时长"拆成若干个不超过 1/60 秒的子步。
+      //   ① 一帧内总推进量 = 真实经过时间 → 任何刷新率下位移都与时间成正比，顺滑；
+      //   ② 单个子步不超过 1/60 秒 → 箭每步最多走 14 单位，远小于命中半径
+      //      （球 21 + 箭 6 = 27），不会出现"箭穿人而过"的漏判；
+      //   ③ 倒计时/回合时间也与现实时间一致，不会因掉帧而变慢。
+      var pdt = Math.min(dt, 0.05);
+      if (pdt > 0) {
+        var steps = Math.ceil(pdt * 60);
+        if (steps < 1) steps = 1;
+        var sdt = pdt / steps;
         var mvp = updateMoveFromKeys();
-        var bEdge = guard === 1 ? consumeBoost() : false; // 冲刺/秒杀只喂给第一个物理步
-        var sEdge = guard === 1 ? consumeSnipe() : false;
-        Eng.setCtrl(practiceGame, 0, { dx: mvp.dx, dy: mvp.dy, aim: aimAngle(), fire: fireDown, boost: bEdge, snipe: sEdge });
-        aiThink(FIXED);
-        Eng.update(practiceGame, FIXED);
+        var aimNow = aimAngle();
+        var bEdge = consumeBoost();   // 冲刺/秒杀只在第一个子步生效（边沿）
+        var sEdge = consumeSnipe();
+        for (var k = 0; k < steps; k++) {
+          Eng.setCtrl(practiceGame, 0, {
+            dx: mvp.dx, dy: mvp.dy, aim: aimNow,
+            fire: fireDown,
+            boost: k === 0 ? bEdge : false,
+            snipe: k === 0 ? sEdge : false
+          });
+          aiThink(sdt);
+          Eng.update(practiceGame, sdt);
+        }
       }
       var snap = Eng.snapshot(practiceGame);
       acceptSnapshot(snap);
@@ -1562,6 +1601,7 @@
     behindExtra = 0;
     extrapN = 0;
     frameN = 0;
+    frameMsSum = 0; frameMsN = 0; frameMsMax = 0;
     ghostArrows.length = 0;
     ghostSeq = -1;
     ghostFireCd = 0;
