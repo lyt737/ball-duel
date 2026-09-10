@@ -534,9 +534,11 @@
         break;
       case 'begin':
         if (m.names) names = m.names.slice();
+        if (netKind === 'mqtt' && window.MQTTNet) window.MQTTNet.onLobbyReceived();
         break;
       case 'state':
         if (mode !== 'online') return;
+        if (netKind === 'mqtt' && window.MQTTNet) window.MQTTNet.onLobbyReceived();
         if (!inPlay && lastSnap === null) {
           showScreen('none');
           showHud(true);
@@ -611,7 +613,8 @@
     } else {
       hint.innerHTML = '将房间号 <b style="letter-spacing:2px">' + m.code + '</b> 或邀请链接发给朋友。<br/>对方加入后，双方点「准备」即可开战。' + hostNote;
     }
-    showScreen('lobby');
+    // 关键：对局进行中收到大厅刷新（如对方重试 join）时，绝不能把玩家踢回大厅界面
+    if (!inPlay) showScreen('lobby');
   }
 
   function createRoom() {
