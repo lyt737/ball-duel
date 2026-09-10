@@ -56,7 +56,7 @@
    */
   var ownSim = null;              // {x,y,vx,vy,boostT,boostCd} 逐帧推进的自身球
   var ownHist = [];               // [{t,x,y,ax,ay}] 原始轨迹 + 记录当时的累计纠偏量
-  var OWN_HIST_MS = 1600;         // 轨迹回溯窗口
+  var OWN_HIST_MS = 2600;         // 轨迹回溯窗口（要能覆盖慢中继的完整往返）
   var lagEst = 0.10;              // 服务端快照相对"本机此刻"的滞后估计（秒）
   var appliedX = 0, appliedY = 0; // 已施加的累计纠偏量
   var driftX = 0, driftY = 0;     // 待逐帧缓慢消化的漂移
@@ -66,6 +66,8 @@
   var ghostArrows = [];           // 本地乐观箭矢（视觉，权威箭出现后退役）
   var ghostSeq = -1;
   var ghostFireCd = 0;            // 本地乐观箭的连发节奏
+  var ghostLocalQuiver = C.QUIVER;// 本地弹药估计（不等一个往返才恢复出箭）
+  var ghostReloadT = 0;           // 本地估计的装弹剩余（秒）
   var ownArrowSeen = {};          // 已见过的"自己的权威箭" id
   var ownArrowSeenN = 0;
 
@@ -628,8 +630,8 @@
   }
 
   // 本地乐观箭矢：按下的瞬间就能看到自己的箭飞出去，不必等一个网络往返
-  function spawnGhostArrow(bx, by, aim, me) {
-    if (!me || me.quiver <= 0 || me.reloading) return; // 没箭/装弹中不产生虚影
+  // （是否还有箭由调用方的"本地弹药估计"决定，保证装弹完成后立刻恢复出箭）
+  function spawnGhostArrow(bx, by, aim) {
     ghostArrows.push({
       id: ghostSeq--, // 负数 id，绝不会与权威箭冲突
       x: bx + Math.cos(aim) * (C.BALL_R + 22),
@@ -644,21 +646,37 @@
   // 推进本地乐观箭矢；按住连发时按本地射速持续补齐；
   // 权威箭一出现就退役一个虚影（retireGhosts），避免重影。
   function stepGhostArrows(dt) {
-    if (mode !== 'online' || isAuthority() || !inPlay) {
+    // 两端都启用：房主的箭要等下一个 tick（~32ms）才由引擎产生，
+    // 加虚影后"按下即见箭"，真箭出现后自动接管。
+    if (mode !== 'online' || !inPlay) {
       ghostArrows.length = 0;
       ghostFireCd = 0;
       return;
     }
     ghostFireCd = Math.max(0, ghostFireCd - dt);
+    ghostReloadT = Math.max(0, ghostReloadT - dt);
+
     var base = lastSnap;
-    if (fireDown && base && base.phase === 'playing' && ghostFireCd <= 0) {
-      var me = base.players[role];
-      if (me && me.quiver > 0 && !me.reloading) {
-        // 用"权威位置 + 权威朝向"生成虚影：这样它和稍后到达的真箭几乎重合，
-        // 真箭一出现把虚影退役时不会"跳一下"。
-        spawnGhostArrow(me.x, me.y, me.aim, me);
-        ghostFireCd = C.FIRE_CD;
+    var me = base ? base.players[role] : null;
+    // 本地弹药估计：快照要一个往返才更新，如果照它判断，
+    // 装弹完成后会有约"一个往返"的时间射不出虚影 → 表现为"开火要过一会儿才出箭"。
+    if (me) {
+      if (me.reloading) {
+        ghostLocalQuiver = 0;
+        if (ghostReloadT <= 0) ghostReloadT = C.RELOAD_DELAY;
+      } else if (me.quiver > ghostLocalQuiver) {
+        ghostLocalQuiver = me.quiver;  // 权威说补满了
       }
+    }
+    if (ghostLocalQuiver <= 0 && ghostReloadT <= 0) ghostLocalQuiver = C.QUIVER;
+
+    if (fireDown && base && me && base.phase === 'playing' && ghostFireCd <= 0 &&
+      ghostLocalQuiver > 0 && ghostReloadT <= 0) {
+      // 用"权威位置 + 权威朝向"生成虚影：这样它和稍后到达的真箭几乎重合，
+      // 真箭一出现把虚影退役时不会"跳一下"。
+      spawnGhostArrow(me.x, me.y, me.aim);
+      ghostLocalQuiver--;
+      ghostFireCd = C.FIRE_CD;
     }
     for (var i = ghostArrows.length - 1; i >= 0; i--) {
       var g = ghostArrows[i];
@@ -1080,7 +1098,10 @@
 
   // 每帧推进自身球：与引擎 simulate() 的移动部分 1:1 一致
   function stepOwnSim(dt) {
-    if (mode !== 'online' || !inPlay || isAuthority() || role == null || !ownSim) return;
+    // 注意：权威端（房主）也要走本地模拟。
+    // 房主自己的球以前是走"快照插值"的，天然带 ~50ms 延迟 + 31Hz 台阶感，
+    // 所以房主也会觉得"操作不跟手"。改成本地模拟后，两端都是零延迟、60fps 平滑。
+    if (mode !== 'online' || !inPlay || role == null || !ownSim) return;
     if (dt <= 0) return;
     if (dt > 0.05) dt = 0.05;
     // 倒计时/结算阶段球不动（由 reconcileOwn 对齐到出生点），不参与积分
@@ -1122,7 +1143,9 @@
       var dm = Math.sqrt(driftX * driftX + driftY * driftY);
       if (dm <= 5) { driftX = 0; driftY = 0; }
       else {
-        var step = Math.min(dm, 320 * dt);
+        // 纠偏速度刻意压低（140 < 移动速度 480 的三分之一）：
+        // 万一延迟估计不准，最多让球略微变慢，绝不会"把移动整个抵消掉"。
+        var step = Math.min(dm, 140 * dt);
         var sx = driftX / dm * step, sy = driftY / dm * step;
         ownSim.x += sx; ownSim.y += sy;
         appliedX += sx; appliedY += sy;
@@ -1147,7 +1170,7 @@
 
   // 收到权威快照后校准：① 延迟对齐 ② 只对真实漂移做温和纠偏
   function reconcileOwn(snap) {
-    if (mode !== 'online' || isAuthority() || role == null) return;
+    if (mode !== 'online' || role == null) return;
     var sp = snap.players[role];
     if (!sp) return;
     var now = performance.now();
@@ -1176,6 +1199,23 @@
       return;
     }
 
+    // 权威端（房主）：本地引擎就是"现在"，不存在网络延迟，无需延迟对齐。
+    // 直接把"引擎位置 − 本地轨迹"当作漂移即可（几乎为 0）。
+    if (isAuthority()) {
+      var axx = sp.x - ownSim.x, ayy = sp.y - ownSim.y;
+      var am = Math.sqrt(axx * axx + ayy * ayy);
+      if (am > 220) {
+        hardAlign({
+          x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy,
+          boostT: sp.boostT || 0, boostCd: sp.boostCd || 0
+        });
+        return;
+      }
+      driftX = axx; driftY = ayy;
+      ownSim.boostCd = sp.boostCd || 0;
+      return;
+    }
+
     // ① 延迟对齐：找到"服务端位置对应于本地轨迹的哪一时刻"
     //    只在确实在移动时更新（静止时搜索结果无意义，会把估计带偏）
     var n = ownHist.length;
@@ -1184,7 +1224,9 @@
       var h1 = ownHist[n - 1];
       if (Math.abs(h1.x - h0.x) + Math.abs(h1.y - h0.y) > 10) {
         var bestLag = lagEst, bestD2 = Infinity;
-        for (var L = 0.02; L <= 0.70; L += 0.02) {
+        // 搜索范围要盖住"完整往返"：慢中继往返可到 1 秒以上。
+        // 上限太小会让 lagEst 顶格 → 每次都算出一大截向后误差 → 把球往回拉 → 表现为"按了不跟手"。
+        for (var L = 0.02; L <= 2.00; L += 0.02) {
           var hp = ownHistPos(now - L * 1000);
           if (!hp) continue;
           var dx0 = (hp.x + (appliedX - hp.ax)) - sp.x;
@@ -1196,7 +1238,7 @@
         var dl = bestLag - lagEst;
         if (dl > 0.04) dl = 0.04; else if (dl < -0.04) dl = -0.04;
         lagEst += dl;
-        if (lagEst < 0) lagEst = 0; else if (lagEst > 0.70) lagEst = 0.70;
+        if (lagEst < 0) lagEst = 0; else if (lagEst > 2.00) lagEst = 2.00;
       }
     }
 
@@ -1224,7 +1266,7 @@
 
   // 权威箭一出现，就退役一个本地乐观箭（避免重影）
   function retireGhosts(snap) {
-    if (isAuthority() || !snap.arrows) return;
+    if (!snap.arrows) return;
     var fresh = 0;
     for (var i = 0; i < snap.arrows.length; i++) {
       var a = snap.arrows[i];
@@ -1481,6 +1523,8 @@
     ghostArrows.length = 0;
     ghostSeq = -1;
     ghostFireCd = 0;
+    ghostLocalQuiver = C.QUIVER;
+    ghostReloadT = 0;
     ownArrowSeen = {};
     ownArrowSeenN = 0;
     boostLocalEdge = false;
