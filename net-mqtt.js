@@ -60,6 +60,18 @@
     try { client.publish(topic, JSON.stringify(obj), { qos: qos || 0, retain: false }); } catch (e) {}
   }
 
+  var lastJoinName = ''; // 房员名字：断线重连后要补发一次 join
+
+  // 断线后自动重连成功：把房间状态补回来，双方可继续对局
+  function onReconnected() {
+    status('back', null);
+    if (isHost) {
+      if (hostRoom) hostRoom.pushLobby();
+    } else {
+      pub(topicIn, { type: 'join', name: lastJoinName || '球手' });
+    }
+  }
+
   // 连接 broker：三个候选中继"同时抢跑"，谁先连上就用谁，其余立即关掉。
   // 比原来"逐个等超时"快得多（原来最坏要等 3×7 秒，这就是"加入时间很长"的原因）。
   // will 为掉线遗嘱消息。
@@ -97,29 +109,42 @@
         var opts = {
           clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
           clean: true,
-          reconnectPeriod: 0,
-          connectTimeout: 5000,
-          keepalive: 30
+          reconnectPeriod: 2500,   // 断线自动重连（原来 0 = 永不重连，一掉线就彻底死了）
+          resubscribe: true,       // 重连后自动恢复订阅
+          connectTimeout: 8000,
+          keepalive: 20            // 更快发现掉线（原 30s，最坏要等 45s）
         };
         if (will) opts.will = will;
         var c;
         try { c = mqtt.connect(url, opts); } catch (e) { allFailed(); return; }
         clients.push(c);
-        var doneFlag = false;
+        var connected = false;
         var timer = setTimeout(function () {
-          if (doneFlag) return;
-          doneFlag = true;
+          if (connected) return;
+          connected = true;
           try { c.end(true); } catch (e) {} // 未连上过 → 没有遗嘱，可强制关
           allFailed();
-        }, 6000);
+        }, 8000);
         c.on('connect', function () {
-          if (doneFlag) return;
-          doneFlag = true; clearTimeout(timer);
+          if (connected) {
+            if (c === client) onReconnected(); // 断线后自动重连成功
+            return;
+          }
+          connected = true; clearTimeout(timer);
           win(c, url);
         });
+        c.on('close', function () {
+          if (c === client && settled) status('lost', url);
+        });
+        c.on('offline', function () {
+          if (c === client && settled) status('lost', url);
+        });
+        c.on('reconnect', function () {
+          if (c === client) status('retry', url);
+        });
         c.on('error', function () {
-          if (doneFlag) return;
-          doneFlag = true; clearTimeout(timer);
+          if (connected) return;
+          connected = true; clearTimeout(timer);
           try { c.end(true); } catch (e) {}
           allFailed();
         });
@@ -380,6 +405,7 @@
 
     join: function (code, name, onMessage, onStatus) {
       onMessageCb = onMessage; onStatusCb = onStatus;
+      lastJoinName = name || '';
       isHost = false;
       roomCode = String(code || '').toUpperCase();
       topicIn = PREFIX + roomCode + '/c2h';
