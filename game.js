@@ -47,6 +47,8 @@
   // 这里让它自己测：一旦发现缓冲不够就立刻加大，长期不紧张就慢慢减小。
   var playoutMs = 110;
   var extrapN = 0;       // 近段统计：有多少帧"缓冲不够、只能外推"（越少越顺，0 最理想）
+  var frameN = 0;        // 近段统计：渲染了多少帧（配合外推数判断严重程度）
+  var behindExtra = 0;   // 兜底自增缓冲：发生外推就抬高，长期平稳就缓慢收回
 
   /* ---------- 联机非权威端：自身球本地连续模拟（根治"走一步又弹回"） ----------
    * 原理：权威端与本地用同一套移动公式、同一份输入，只是相差一个网络延迟。
@@ -150,7 +152,8 @@
     el.style.display = 'block';
 
     var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
-    var ex = extrapN; extrapN = 0; // 每 0.5 秒汇报一次，理想是 0
+    var ex = extrapN; extrapN = 0;   // 每 0.5 秒汇报一次，理想是 0
+    var fr = frameN; frameN = 0;
 
     if (isAuthority()) {
       // 房主：衡量"对方输入到达的抖动"，越大说明对方网络越抖
@@ -168,7 +171,8 @@
       var verdict = cls === 'ok' ? '网络良好' : (cls === 'mid' ? '网络一般（偶有顿挫）' : '网络很差（中继拥堵）');
       el.className = 'netStat ' + cls;
       el.textContent = head +
-        '抖动 ' + jj + 'ms · 间隔 ' + Math.round(snapGapMs) + '/' + Math.round(snapGapPeak) + 'ms · 外推 ' + ex +
+        '抖动 ' + jj + 'ms · 间隔 ' + Math.round(snapGapMs) + '/' + Math.round(snapGapPeak) + 'ms' +
+        '\n外推 ' + ex + ' / ' + fr + ' 帧 · 缓冲 ' + Math.round(playoutMs) + 'ms' +
         '\n判定：' + verdict;
     }
   }
@@ -958,8 +962,10 @@
       //   ③ 全程只用"本机时钟的差值"，不比较两机绝对时钟 → 不存在时钟原点不一致的问题。
       key = 'ht';
       var newestE = hist[hist.length - 1];
-      // 1.55 倍是实测出来的折中：外推率约 0.4%（几乎不再顿挫），附加延迟约 190ms
-      var behind = Math.max(45, snapGapPeak * 1.55);
+      // 1.55 倍是实测出来的折中；behindExtra 是"兜底自增"：
+      // 一旦真的发生外推，就把缓冲永久抬高一点，保证同样的坑不会踩第二次。
+      var behind = Math.max(45, snapGapPeak * 1.55) + behindExtra;
+      behindExtra = Math.max(0, behindExtra - 0.15); // 缓慢回落，长期不紧张就收回去
       playoutMs = behind; // 仅用于左上角显示
       targetT = newestE.ht + (performance.now() - newestE.t) - behind;
     } else {
@@ -985,10 +991,19 @@
     }
     // 缓冲用尽（快照还没到）：沿最后已知速度做极短外推，而不是冻在上一帧。
     // 外推上限 80ms，既避免"冻结顿挫"，也不会飘得太远。
-    if (!b) return extrapolateSnap(a.s, targetT - a[key]);
+    if (!b) {
+      // 真的没有更新的快照可用 → 记下超出量，把缓冲永久抬高一点，保证不反复踩坑
+      var overMs = targetT - a[key];
+      if (overMs > 0) behindExtra = Math.min(500, behindExtra + Math.min(overMs, 80));
+      return extrapolateSnap(a.s, overMs);
+    }
     if (b[key] === a[key]) return b.s;
     if (targetT <= a[key]) return a.s;
-    if (targetT >= b[key]) return extrapolateSnap(b.s, targetT - b[key]);
+    if (targetT >= b[key]) {
+      var overMs2 = targetT - b[key];
+      if (overMs2 > 0) behindExtra = Math.min(500, behindExtra + Math.min(overMs2, 80));
+      return extrapolateSnap(b.s, overMs2);
+    }
     var t = (targetT - a[key]) / (b[key] - a[key]);
     var s0 = a.s, s1 = b.s; // 两个原始快照
     var out = {
@@ -1227,21 +1242,24 @@
         });
         return;
       }
-      driftX = axx; driftY = ayy;
+      // 同样做低通，避免 31Hz 快照让纠偏方向来回翻转
+      driftX = driftX * 0.7 + axx * 0.3;
+      driftY = driftY * 0.7 + ayy * 0.3;
       ownSim.boostCd = sp.boostCd || 0;
       return;
     }
 
-    // ① 延迟对齐：找到"服务端位置对应于本地轨迹的哪一时刻"
-    //    只在确实在移动时更新（静止时搜索结果无意义，会把估计带偏）
+    // ① 延迟对齐：找到"服务端位置对应于本地轨迹的哪一时刻"。
+    //    【关键】只有"确实吻合"时才采信。球来回拐弯时，位置匹配可能凑巧对到错误的时刻，
+    //    一旦采信就会算出一大截假漂移，然后纠偏把球来回拽 → 表现就是"即停即走、飘忽不定"。
+    var confident = false;
     var n = ownHist.length;
     if (n >= 6) {
       var h0 = ownHist[n - 8 < 0 ? 0 : n - 8];
       var h1 = ownHist[n - 1];
       if (Math.abs(h1.x - h0.x) + Math.abs(h1.y - h0.y) > 10) {
         var bestLag = lagEst, bestD2 = Infinity;
-        // 搜索范围要盖住"完整往返"：慢中继往返可到 1 秒以上。
-        // 上限太小会让 lagEst 顶格 → 每次都算出一大截向后误差 → 把球往回拉 → 表现为"按了不跟手"。
+        // 搜索范围要盖住"完整往返"：慢中继往返可到 1 秒以上
         for (var L = 0.02; L <= 2.00; L += 0.02) {
           var hp = ownHistPos(now - L * 1000);
           if (!hp) continue;
@@ -1250,16 +1268,19 @@
           var d2 = dx0 * dx0 + dy0 * dy0;
           if (d2 < bestD2) { bestD2 = d2; bestLag = L; }
         }
-        // 平滑跟踪 + 限幅，避免网络抖动让延迟估计乱跳
-        var dl = bestLag - lagEst;
-        if (dl > 0.04) dl = 0.04; else if (dl < -0.04) dl = -0.04;
-        lagEst += dl;
-        if (lagEst < 0) lagEst = 0; else if (lagEst > 2.00) lagEst = 2.00;
+        // 吻合点必须足够贴合（80 世界单位内）才算可信
+        if (bestD2 < 6400) {
+          confident = true;
+          var dl = bestLag - lagEst;
+          if (dl > 0.04) dl = 0.04; else if (dl < -0.04) dl = -0.04;
+          lagEst += dl;
+          if (lagEst < 0) lagEst = 0; else if (lagEst > 2.00) lagEst = 2.00;
+        }
       }
     }
 
-    // ② 真实漂移 = 服务端位置 − 本地轨迹在 (此刻 − 延迟) 的位置
-    var ref = ownHistPos(now - lagEst * 1000);
+    // ② 计算漂移（仅在"对齐可信"时）
+    var ref = confident ? ownHistPos(now - lagEst * 1000) : null;
     var ex = 0, ey = 0;
     if (ref) {
       ex = sp.x - (ref.x + (appliedX - ref.ax));
@@ -1267,17 +1288,18 @@
     }
     var mag = Math.sqrt(ex * ex + ey * ey);
 
-    // ③ 漂移过大 = 传送/复活/回合重置：唯一允许硬对齐的情况
-    if (mag > 340) {
-      hardAlign({
-        x: sp.x, y: sp.y, vx: sp.vx, vy: sp.vy,
-        boostT: sp.boostT || 0, boostCd: sp.boostCd || 0
-      });
+    // ③ 不可信、或漂移过大（多半是估计误差）：一律不纠偏。
+    //    本地模拟与权威端跑的是同一套公式、同一份"绝对状态"输入，
+    //    丢一次输入也会被下一次立刻纠正，所以短期不纠偏是安全的 —— 换来的是绝对平滑。
+    if (!confident || mag > 120) {
+      driftX = 0; driftY = 0;
       return;
     }
 
-    // ④ 通常情形：把漂移交给 stepOwnSim 逐帧缓慢消化
-    driftX = ex; driftY = ey;
+    // ④ 低通平滑后再交给 stepOwnSim 缓慢消化：
+    //    避免 31Hz 的快照让漂移方向来回翻转，把球拽得一抖一抖。
+    driftX = driftX * 0.75 + ex * 0.25;
+    driftY = driftY * 0.75 + ey * 0.25;
   }
 
   // 权威箭一出现，就退役一个本地乐观箭（避免重影）
@@ -1448,6 +1470,7 @@
     requestAnimationFrame(frame);
     var dt = Math.min(0.05, lastT ? (now - lastT) / 1000 : 0);
     lastT = now;
+    frameN++;
 
     updateNetStat(now);
 
@@ -1536,6 +1559,9 @@
     clkReady = false;
     histClock = '';
     playoutMs = 110;
+    behindExtra = 0;
+    extrapN = 0;
+    frameN = 0;
     ghostArrows.length = 0;
     ghostSeq = -1;
     ghostFireCd = 0;
