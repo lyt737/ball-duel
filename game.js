@@ -39,9 +39,14 @@
    */
   var clkSamples = [];   // [{t, obs}] 最近 3 秒的"本机时间 − 主机时间"观测
   var clkOff = 0;        // 两机时钟偏移（取窗口内最小值 = 最快到达的那条）
-  var clkJitter = 0;     // 窗口内 90 分位的额外延迟 → 播放缓冲要盖住它
+  var clkJitter = 0;     // 窗口内 90 分位的额外延迟
   var clkReady = false;
   var histClock = '';    // 'host' | 'arrival'：时间轴口径，切换时清空历史
+  // 自适应播放缓冲（ms）：房员把对手"回放"到多久之前。
+  // 太小 → 缓冲不够，只能靠外推 → 一卡一跳；太大 → 对手慢半拍。
+  // 这里让它自己测：一旦发现缓冲不够就立刻加大，长期不紧张就慢慢减小。
+  var playoutMs = 110;
+  var extrapN = 0;       // 近段统计：有多少帧"缓冲不够、只能外推"（越少越顺，0 最理想）
 
   /* ---------- 联机非权威端：自身球本地连续模拟（根治"走一步又弹回"） ----------
    * 原理：权威端与本地用同一套移动公式、同一份输入，只是相差一个网络延迟。
@@ -131,21 +136,24 @@
     if (mode !== 'online' || !inPlay) { el.style.display = 'none'; return; }
     el.style.display = '';
 
-    var prefix = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + ' · ' : '';
+    var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
+    var ex = extrapN; extrapN = 0; // 每 0.5 秒汇报一次，理想是 0
 
     if (isAuthority()) {
       // 房主：衡量"对方输入到达的抖动"，越大说明对方网络越抖
       var st = (window.MQTTNet && window.MQTTNet.stats) ? window.MQTTNet.stats() : null;
       var j = st ? Math.round(st.inGapPeak) : 0;
       el.className = 'netStat ' + (j < 60 ? 'ok' : (j < 140 ? 'mid' : 'bad'));
-      el.textContent = prefix + '房主 · 对方抖动 ' + j + 'ms';
+      el.textContent = head + '房主 · 对方抖动 ' + j + 'ms · 我方快照间隔 ' + Math.round(snapGapMs) + 'ms';
     } else if (!clkReady) {
       el.className = 'netStat mid';
-      el.textContent = prefix + '测量中…';
+      el.textContent = head + '测量中…';
     } else {
       var jj = Math.round(clkJitter);
-      el.className = 'netStat ' + (jj < 50 ? 'ok' : (jj < 120 ? 'mid' : 'bad'));
-      el.textContent = prefix + '抖动 ' + jj + 'ms';
+      var cls = (jj < 60 && ex === 0) ? 'ok' : ((jj < 150 && ex < 10) ? 'mid' : 'bad');
+      el.className = 'netStat ' + cls;
+      el.textContent = head +
+        '抖动 ' + jj + 'ms · 缓冲 ' + Math.round(playoutMs) + 'ms · 间隔 ' + Math.round(snapGapMs) + 'ms · 外推 ' + ex;
     }
   }
 
@@ -641,9 +649,9 @@
     if (fireDown && base && base.phase === 'playing' && ghostFireCd <= 0) {
       var me = base.players[role];
       if (me && me.quiver > 0 && !me.reloading) {
-        var aim = aimAngle();
-        var src = ownSim || me;
-        spawnGhostArrow(src.x, src.y, aim, me);
+        // 用"权威位置 + 权威朝向"生成虚影：这样它和稍后到达的真箭几乎重合，
+        // 真箭一出现把虚影退役时不会"跳一下"。
+        spawnGhostArrow(me.x, me.y, me.aim, me);
         ghostFireCd = C.FIRE_CD;
       }
     }
@@ -865,7 +873,14 @@
       clkSamples.length = 0;
       clkReady = false;
     }
-    if (useHost) clockUpdate(now, hostT);
+    if (useHost) {
+      clockUpdate(now, hostT);
+      // 播放缓冲自适应（只在收到快照时调整，避免每帧累加导致失控）：
+      // 这条快照比"最快的那条"多出来的延迟，加上一个快照间隔，就是至少需要的缓冲。
+      var gapHT = Math.max(16, snapGapMs);
+      var need = ((now - hostT) - clkOff) + gapHT * 1.25;
+      if (need > playoutMs) playoutMs = Math.min(360, playoutMs + Math.min(need - playoutMs, 25));
+    }
     // 统计快照到达间隔：用于自适应插值缓冲（网络越抖，缓冲越大）。
     // 同时跟踪"衰减峰值"——缓冲必须能盖住最坏的那次抖动，否则就会冻一帧再跳。
     if (snapArrLast) {
@@ -902,12 +917,12 @@
     var useHost = (histClock === 'host') && clkReady;
     var key, targetT;
     if (useHost) {
-      // —— 无抖动时间线 ——
+      // —— 无抖动时间线 + 自适应播放缓冲 ——
       // 主机时间戳 ht 是等间隔的，用它当坐标轴，插值出来的运动天然平滑。
-      // 播放缓冲 = 基础 50ms + 实测抖动（90 分位），刚好盖住网络抖动，不多不少。
+      // 缓冲的"抬高"在收到快照时做（acceptSnapshot），这里只做缓慢回落。
       key = 'ht';
-      var delay = 50 + Math.min(220, clkJitter);
-      targetT = (performance.now() - delay) - clkOff;
+      playoutMs = Math.max(70, playoutMs - 0.12);
+      targetT = performance.now() - playoutMs - clkOff;
     } else {
       // 拿不到主机时间戳（老协议/自建服务器）：退回按"到达时间"插值
       key = 't';
@@ -1001,6 +1016,7 @@
     var over = overMs / 1000;
     if (!(over > 0)) return s;
     if (over > 0.08) over = 0.08;
+    extrapN++; // 记一次"缓冲不够"（用于左上角诊断：理想是 0）
     var r = C.BALL_R;
     var out = {
       w: s.w, h: s.h, phase: s.phase, phaseT: s.phaseT,
@@ -1456,6 +1472,7 @@
     clkJitter = 0;
     clkReady = false;
     histClock = '';
+    playoutMs = 110;
     ghostArrows.length = 0;
     ghostSeq = -1;
     ghostFireCd = 0;
