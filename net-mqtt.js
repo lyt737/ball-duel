@@ -253,9 +253,12 @@
     }
     Eng.update(this.game, tickDt);
     var snap = Eng.snapshot(this.game);
+    // 关键：带上"主机时间戳"。主机时间戳是等间隔产出的，
+    // 房员据此可以建立一条无抖动的时间线来插值，才不会看房主"一卡一跳"。
+    var msg = { t: 'state', s: snap, ht: tickNow };
     // 本机渲染（关键：房主自己也要收到快照）
-    this.onMessage({ t: 'state', s: snap });
-    pub(topicOut, { t: 'state', s: snap });
+    this.onMessage(msg);
+    pub(topicOut, msg);
   };
 
   HostRoom.prototype.run = function () {
