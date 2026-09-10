@@ -45,7 +45,8 @@
   }
 
   function newInput() {
-    return { k: { w: false, a: false, s: false, d: false }, aim: 0, fire: false, boost: false, snipe: false };
+    // t：这条输入最后一次刷新的时间，用于"输入超时保护"
+    return { t: 0, k: { w: false, a: false, s: false, d: false }, aim: 0, fire: false, boost: false, snipe: false };
   }
 
   function pub(topic, obj, qos) {
@@ -193,6 +194,7 @@
       inp.fire = !!m.fire;
       inp.boost = !!m.boost;
       inp.snipe = !!m.snipe;
+      inp.t = performance.now();
       // 移动键额外进入抖动缓冲：网络抖动会让消息"忽快忽慢地到"，
       // 直接照单全收就会变成房员球的急停急走；缓冲后按固定延迟播放，
       // 输入流变平稳，房主看房员才不会一顿一顿。
@@ -236,6 +238,22 @@
     inp.fire = !!m.fire;
     inp.boost = !!m.boost;
     inp.snipe = !!m.snipe;
+    inp.t = performance.now();
+  };
+
+  // 【防自动攻击】输入超时保护：
+  // 某一端如果 450ms 没有任何输入上报（切后台、掉线、卡住、鼠标状态残留），
+  // 就把它清零。否则 fire=true 会一直挂着，表现成"没人按键却一直射"。
+  HostRoom.prototype.expireInputs = function (now) {
+    for (var i = 0; i < 2; i++) {
+      var inp = this.inputs[i];
+      if (!inp.t || now - inp.t <= 450) continue;
+      inp.fire = false;
+      inp.boost = false;
+      inp.snipe = false;
+      inp.k.w = inp.k.a = inp.k.s = inp.k.d = false;
+      if (i === 1) this.mq.length = 0; // 远端输入抖动缓冲也一并作废
+    }
   };
 
   // 从抖动缓冲里取出"延迟 REMOTE_INPUT_DELAY 之前那一格"的移动键
@@ -262,6 +280,7 @@
     this.lastTick = tickNow;
     if (!(tickDt > 0)) tickDt = 1 / 30;
     if (tickDt > 0.05) tickDt = 0.05;
+    this.expireInputs(tickNow);
     this.pickRemoteKeys(tickNow);
     for (var i = 0; i < 2; i++) {
       var k = this.inputs[i].k;
