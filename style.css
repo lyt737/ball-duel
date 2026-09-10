@@ -98,7 +98,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .secondary { background: linear-gradient(135deg, #10b981, #059669); }
 .ghost { background: #fff; color: var(--ink); border: 1.5px solid var(--line); box-shadow: none; }
 .ghost:hover { background: #f8fafc; }
-button.big { padding: 15px; font-size: 17px; }
+button.btnlg { padding: 15px; font-size: 17px; }
 
 .divider {
   display: flex; align-items: center; gap: 10px;
@@ -162,6 +162,7 @@ kbd {
 .rrow .tag-you { color: var(--ink); background: #e2e8f0; padding: 4px 10px; border-radius: 999px; }
 
 .lobbyHint { font-size: 13px; color: var(--muted); margin: 4px 0 8px; line-height: 1.7; }
+.hostNote { margin-top: 8px; padding: 7px 10px; border-radius: 8px; background: #fef3c7; color: #92400e; font-weight: 600; }
 
 /* ---------- HUD ---------- */
 #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; }
@@ -247,7 +248,8 @@ kbd {
 /* ---------- 中央提示 ---------- */
 #centerWrap { position: fixed; inset: 0; pointer-events: none; z-index: 30; }
 
-.big {
+/* 倒计时数字（限定 id，避免与其他元素的 class 冲突） */
+#countdown {
   position: absolute; top: 44%; left: 50%;
   transform: translate(-50%, -50%);
   font-size: 130px; font-weight: 900;
@@ -255,7 +257,7 @@ kbd {
   text-shadow: 0 12px 40px rgba(15,23,42,.12);
   animation: pop .35s ease-out;
 }
-.big.go { color: #059669; }
+#countdown.go { color: #059669; }
 
 .banner {
   position: absolute; top: 46%; left: 50%;
@@ -295,7 +297,7 @@ kbd {
 @media (max-width: 720px) {
   .pcard { width: 170px; }
   .aimTip { display: none; }
-  .big { font-size: 90px; }
+  #countdown { font-size: 90px; }
   .banner .b-title { font-size: 36px; }
   .score { font-size: 20px; padding: 6px 14px; gap: 8px; }
   h1 { font-size: 34px; }
