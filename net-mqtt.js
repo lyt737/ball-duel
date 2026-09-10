@@ -17,7 +17,8 @@
   // 房主广播快照的节拍（ms）：31Hz 左右，比 20Hz 更跟手、插值缓冲也能更小
   var TICK_MS = 32;
 
-  // 多个公共 broker：启动时"同时抢跑"，谁先连上就用谁。
+  // 公共 broker 候选。注意：它们之间【互不相通】，
+  // 所以必须由房间号"确定性地"决定用哪一个（见 brokerOrder），保证双方连同一个。
   // 实测握手耗时（≈网络往返，越小越好）：
   //   broker.emqx.io       0.57s  ← 最快
   //   broker-cn.emqx.io    0.85s  ← EMQX 国内节点
@@ -40,6 +41,7 @@
   var hostRoom = null;
   var joinTimer = null;
   var joinTries = 0;
+  var lobbyAt = 0;    // 最近一次收到"房间信息"的时刻（用于判断加入是否真的成功）
 
   function status(s, extra) { if (onStatusCb) onStatusCb(s, extra); }
 
@@ -72,91 +74,82 @@
     }
   }
 
-  // 连接 broker：三个候选中继"同时抢跑"，谁先连上就用谁，其余立即关掉。
-  // 比原来"逐个等超时"快得多（原来最坏要等 3×7 秒，这就是"加入时间很长"的原因）。
+  // 依据房间号"确定性地"决定中继先后顺序。
+  // 为什么必须确定：公共中继之间【不互通】——房主连 emqx、房员连 emqx-cn 的话，
+  // 消息根本传不过去，就会出现"他能看到我、我却看不到他"。
+  // 双方用同一个房间号算出同一个顺序，就能保证连到同一个中继。
+  function brokerOrder(code) {
+    var h = 0, s = String(code || '');
+    for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    var fast = [BROKERS[0], BROKERS[1]];
+    var start = h % fast.length;
+    var out = [fast[start], fast[1 - start]];
+    for (var k = 2; k < BROKERS.length; k++) out.push(BROKERS[k]);
+    return out;
+  }
+
+  // 连接 broker：按房间号推导的顺序【逐个尝试】，第一个连上的就用它。
   // will 为掉线遗嘱消息。
-  function connectBroker(done, will) {
+  function connectBroker(code, done, will) {
     if (typeof mqtt === 'undefined' || !mqtt || !mqtt.connect) {
       status('fail', '中继组件未加载（页面可能没加载完），请刷新后重试');
       return;
     }
-    var settled = false;
-    var failed = 0;
-    var clients = [];
+    var order = brokerOrder(code);
+    var i = 0;
 
-    function allFailed() {
-      failed++;
-      if (!settled && failed >= BROKERS.length) {
-        settled = true;
+    function attempt() {
+      if (i >= order.length) {
         status('fail', '所有公共中继都连不上，请检查网络后重试');
+        return;
       }
+      var url = order[i++];
+      var opts = {
+        clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
+        clean: true,
+        reconnectPeriod: 2500,   // 断线自动重连（原来 0 = 永不重连，一掉线就彻底死了）
+        resubscribe: true,       // 重连后自动恢复订阅
+        connectTimeout: 6000,
+        keepalive: 20            // 更快发现掉线
+      };
+      if (will) opts.will = will;
+      var c;
+      try { c = mqtt.connect(url, opts); } catch (e) { attempt(); return; }
+      var connected = false;
+      var timer = setTimeout(function () {
+        if (connected) return;
+        connected = true;
+        try { c.end(true); } catch (e) {} // 未连上过 → 没有遗嘱，可强制关
+        attempt();
+      }, 6000);
+      c.on('connect', function () {
+        if (connected) {
+          if (c === client) onReconnected(); // 断线后自动重连成功
+          return;
+        }
+        connected = true; clearTimeout(timer);
+        client = c;
+        status('ok', url);
+        done(c);
+      });
+      c.on('close', function () { if (c === client) status('lost', url); });
+      c.on('offline', function () { if (c === client) status('lost', url); });
+      c.on('reconnect', function () { if (c === client) status('retry', url); });
+      c.on('error', function () {
+        if (connected) return;
+        connected = true; clearTimeout(timer);
+        try { c.end(true); } catch (e) {}
+        attempt();
+      });
+      c.on('message', function (topic, payload) {
+        if (c !== client) return;
+        var m;
+        try { m = JSON.parse(payload.toString()); } catch (e) { return; }
+        if (isHost && hostRoom) hostRoom.onGuestMsg(m);
+        else if (!isHost && onMessageCb) onMessageCb(m);
+      });
     }
-    function win(c, url) {
-      if (settled) return;
-      settled = true;
-      for (var k = 0; k < clients.length; k++) {
-        if (clients[k] === c) continue;
-        // 用优雅断开：避免触发已注册的遗嘱消息，把对方误判成"已离开"
-        try { clients[k].end(false); } catch (e) {}
-      }
-      client = c;
-      status('ok', url);
-      done(c);
-    }
-
-    for (var i = 0; i < BROKERS.length; i++) {
-      (function (url) {
-        var opts = {
-          clientId: 'qy_' + Math.random().toString(16).slice(2, 12),
-          clean: true,
-          reconnectPeriod: 2500,   // 断线自动重连（原来 0 = 永不重连，一掉线就彻底死了）
-          resubscribe: true,       // 重连后自动恢复订阅
-          connectTimeout: 8000,
-          keepalive: 20            // 更快发现掉线（原 30s，最坏要等 45s）
-        };
-        if (will) opts.will = will;
-        var c;
-        try { c = mqtt.connect(url, opts); } catch (e) { allFailed(); return; }
-        clients.push(c);
-        var connected = false;
-        var timer = setTimeout(function () {
-          if (connected) return;
-          connected = true;
-          try { c.end(true); } catch (e) {} // 未连上过 → 没有遗嘱，可强制关
-          allFailed();
-        }, 8000);
-        c.on('connect', function () {
-          if (connected) {
-            if (c === client) onReconnected(); // 断线后自动重连成功
-            return;
-          }
-          connected = true; clearTimeout(timer);
-          win(c, url);
-        });
-        c.on('close', function () {
-          if (c === client && settled) status('lost', url);
-        });
-        c.on('offline', function () {
-          if (c === client && settled) status('lost', url);
-        });
-        c.on('reconnect', function () {
-          if (c === client) status('retry', url);
-        });
-        c.on('error', function () {
-          if (connected) return;
-          connected = true; clearTimeout(timer);
-          try { c.end(true); } catch (e) {}
-          allFailed();
-        });
-        c.on('message', function (topic, payload) {
-          if (c !== client) return; // 落选的连接不处理消息，避免重复
-          var m;
-          try { m = JSON.parse(payload.toString()); } catch (e) { return; }
-          if (isHost && hostRoom) hostRoom.onGuestMsg(m);
-          else if (!isHost && onMessageCb) onMessageCb(m);
-        });
-      })(BROKERS[i]);
-    }
+    attempt();
   }
 
   /* ===================== HOST ===================== */
@@ -394,7 +387,7 @@
       topicIn = PREFIX + roomCode + '/c2h';
       topicOut = PREFIX + roomCode + '/h2c';
       var will = { topic: topicOut, payload: JSON.stringify({ t: 'peerLeft', message: '房主已离开房间' }), qos: 0 };
-      connectBroker(function (c) {
+      connectBroker(roomCode, function (c) {
         c.subscribe(topicIn, function () {});
         hostRoom = new HostRoom(roomCode, name, onMessage);
         hostRoom.run();
@@ -411,8 +404,13 @@
       topicIn = PREFIX + roomCode + '/c2h';
       topicOut = PREFIX + roomCode + '/h2c';
       var will = { topic: topicIn, payload: JSON.stringify({ type: 'leave' }), qos: 0 };
-      connectBroker(function (c) {
+      connectBroker(roomCode, function (c) {
         onStatus('ready', roomCode);
+        // 8 秒还没收到房主的房间信息 → 明确提示，便于区分"没连上"和"对方没响应"
+        var t0 = performance.now();
+        setTimeout(function () {
+          if (!lobbyAt || lobbyAt < t0) status('waitjoin', roomCode);
+        }, 8000);
         // 关键：等订阅成功后再上报 join，否则会错过房主回的房间信息
         c.subscribe(topicOut, function () {
           joinTries = 0;
@@ -429,6 +427,7 @@
     },
 
     onLobbyReceived: function () {
+      lobbyAt = performance.now();
       if (joinTimer) { clearInterval(joinTimer); joinTimer = null; }
     },
 
