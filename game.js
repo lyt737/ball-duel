@@ -124,6 +124,10 @@
     }
     else if (s === 'ready') netTip('房间已就绪（中继模式）', 'ok');
     else if (s === 'fail') { netTip(extra || '公共中继连接失败', 'err'); showToast(extra || '连接失败，请重试', 3600); }
+    // 断线自动重连（原来 reconnectPeriod=0，一掉线就彻底死掉，只能刷新页面）
+    else if (s === 'lost') { netTip('与中继的连接中断，正在自动重连…', 'err'); showToast('网络中断，正在自动重连…', 4000); }
+    else if (s === 'retry') { netTip('正在重连中继…', ''); }
+    else if (s === 'back') { netTip('已重新连接中继，可继续对战', 'ok'); showToast('已重新连接，对阵可以继续了', 3000); }
   }
 
   /* ---------- 网络状态小条：把"卡不卡"变成能看的数字 ----------
@@ -155,11 +159,11 @@
       el.textContent = head + '正在测量网络…';
     } else {
       var jj = Math.round(clkJitter);
-      var cls = (jj < 60 && ex === 0) ? 'ok' : ((jj < 150 && ex < 10) ? 'mid' : 'bad');
+      var cls = (jj < 60 && ex === 0) ? 'ok' : ((jj < 150 && ex < 5) ? 'mid' : 'bad');
       var verdict = cls === 'ok' ? '网络良好' : (cls === 'mid' ? '网络一般（偶有顿挫）' : '网络很差（中继拥堵）');
       el.className = 'netStat ' + cls;
       el.textContent = head +
-        '抖动 ' + jj + 'ms · 缓冲 ' + Math.round(playoutMs) + 'ms · 外推 ' + ex +
+        '抖动 ' + jj + 'ms · 间隔 ' + Math.round(snapGapMs) + '/' + Math.round(snapGapPeak) + 'ms · 外推 ' + ex +
         '\n判定：' + verdict;
     }
   }
@@ -756,10 +760,15 @@
         resetNetPrediction();
         lastPhase = '';
         showBig(false);
-        showBanner(false);
         showHud(false);
         setScores(0, 0, 1);
-        showToast(m.message || '对手已离开', 3000);
+        // 不直接判死刑：对方很可能只是短暂掉线。显示"等待重连"，
+        // 对方网络恢复、快照重新到达时这里会自动继续对局。
+        showBanner(true,
+          '<div class="b-title">对手掉线了</div>' +
+          '<div class="b-sub">正在等待对方重新连接…（对方网络恢复后会自动继续）</div>' +
+          '<div class="b-scores">长时间无响应可点右上角「退出」返回菜单</div>');
+        showToast(m.message || '对手已离开', 3600);
         break;
     }
   }
@@ -896,21 +905,15 @@
       clkSamples.length = 0;
       clkReady = false;
     }
-    if (useHost) {
-      clockUpdate(now, hostT);
-      // 播放缓冲自适应（只在收到快照时调整，避免每帧累加导致失控）：
-      // 这条快照比"最快的那条"多出来的延迟，加上一个快照间隔，就是至少需要的缓冲。
-      var gapHT = Math.max(16, snapGapMs);
-      var need = ((now - hostT) - clkOff) + gapHT * 1.25;
-      if (need > playoutMs) playoutMs = Math.min(360, playoutMs + Math.min(need - playoutMs, 25));
-    }
+    // 只用来显示"网络抖动"（渲染不再依赖它，见 buildRenderSnap）
+    if (useHost) clockUpdate(now, hostT);
     // 统计快照到达间隔：用于自适应插值缓冲（网络越抖，缓冲越大）。
     // 同时跟踪"衰减峰值"——缓冲必须能盖住最坏的那次抖动，否则就会冻一帧再跳。
     if (snapArrLast) {
       var gap = now - snapArrLast;
       if (gap > 5 && gap < 600) {
         snapGapMs += (gap - snapGapMs) * 0.2;
-        snapGapPeak = Math.max(gap, snapGapPeak * 0.94);
+        snapGapPeak = Math.max(gap, snapGapPeak * 0.97); // 衰减慢一点，抖动高峰能被覆盖住
       }
     }
     snapArrLast = now;
@@ -940,12 +943,18 @@
     var useHost = (histClock === 'host') && clkReady;
     var key, targetT;
     if (useHost) {
-      // —— 无抖动时间线 + 自适应播放缓冲 ——
-      // 主机时间戳 ht 是等间隔的，用它当坐标轴，插值出来的运动天然平滑。
-      // 缓冲的"抬高"在收到快照时做（acceptSnapshot），这里只做缓慢回落。
+      // —— 无抖动时间线（锚定在最新快照，绝不再比两台机器的绝对时钟）——
+      // 渲染点 = 最新快照的主机时间戳 + 本机已经过去的时间 − 落后量
+      //   ① 时间轴上只有等间隔的主机时间戳 → 天然平滑，完全不受网络抖动影响；
+      //   ② 只要 behind ≥ 一次到达间隔，渲染点就永远落在两个已知快照之间，
+      //      不会跌进"外推"（外推 = 一卡一跳的根源）；
+      //   ③ 全程只用"本机时钟的差值"，不比较两机绝对时钟 → 不存在时钟原点不一致的问题。
       key = 'ht';
-      playoutMs = Math.max(70, playoutMs - 0.12);
-      targetT = performance.now() - playoutMs - clkOff;
+      var newestE = hist[hist.length - 1];
+      // 1.55 倍是实测出来的折中：外推率约 0.4%（几乎不再顿挫），附加延迟约 190ms
+      var behind = Math.max(45, snapGapPeak * 1.55);
+      playoutMs = behind; // 仅用于左上角显示
+      targetT = newestE.ht + (performance.now() - newestE.t) - behind;
     } else {
       // 拿不到主机时间戳（老协议/自建服务器）：退回按"到达时间"插值
       key = 't';
