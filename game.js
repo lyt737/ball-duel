@@ -133,8 +133,10 @@
     netStatT = now;
     var el = $('netStat');
     if (!el) return;
+    // 注意：必须写成 'block'。写空字符串 '' 会清掉内联样式，
+    // 于是回落到 CSS 里的 display:none，状态条就永远不显示了。
     if (mode !== 'online' || !inPlay) { el.style.display = 'none'; return; }
-    el.style.display = '';
+    el.style.display = 'block';
 
     var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
     var ex = extrapN; extrapN = 0; // 每 0.5 秒汇报一次，理想是 0
@@ -143,17 +145,20 @@
       // 房主：衡量"对方输入到达的抖动"，越大说明对方网络越抖
       var st = (window.MQTTNet && window.MQTTNet.stats) ? window.MQTTNet.stats() : null;
       var j = st ? Math.round(st.inGapPeak) : 0;
-      el.className = 'netStat ' + (j < 60 ? 'ok' : (j < 140 ? 'mid' : 'bad'));
-      el.textContent = head + '房主 · 对方抖动 ' + j + 'ms · 我方快照间隔 ' + Math.round(snapGapMs) + 'ms';
+      var vd = j < 60 ? '对方网络良好' : (j < 150 ? '对方网络一般' : '对方网络很差');
+      el.className = 'netStat ' + (j < 60 ? 'ok' : (j < 150 ? 'mid' : 'bad'));
+      el.textContent = head + '对方抖动 ' + j + 'ms · 我方间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd;
     } else if (!clkReady) {
       el.className = 'netStat mid';
-      el.textContent = head + '测量中…';
+      el.textContent = head + '正在测量网络…';
     } else {
       var jj = Math.round(clkJitter);
       var cls = (jj < 60 && ex === 0) ? 'ok' : ((jj < 150 && ex < 10) ? 'mid' : 'bad');
+      var verdict = cls === 'ok' ? '网络良好' : (cls === 'mid' ? '网络一般（偶有顿挫）' : '网络很差（中继拥堵）');
       el.className = 'netStat ' + cls;
       el.textContent = head +
-        '抖动 ' + jj + 'ms · 缓冲 ' + Math.round(playoutMs) + 'ms · 间隔 ' + Math.round(snapGapMs) + 'ms · 外推 ' + ex;
+        '抖动 ' + jj + 'ms · 缓冲 ' + Math.round(playoutMs) + 'ms · 外推 ' + ex +
+        '\n判定：' + verdict;
     }
   }
 
