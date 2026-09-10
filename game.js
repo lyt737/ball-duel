@@ -45,7 +45,8 @@
   var appliedX = 0, appliedY = 0; // 已施加的累计纠偏量
   var driftX = 0, driftY = 0;     // 待逐帧缓慢消化的漂移
   var snapArrLast = 0;            // 上一个快照到达时刻
-  var snapGapMs = 50;             // 平滑后的快照到达间隔（ms）
+  var snapGapMs = 50;             // 平滑后的快照到达间隔均值（ms）
+  var snapGapPeak = 50;           // 到达间隔的"衰减峰值"（ms）——决定插值缓冲要多大
   var ghostArrows = [];           // 本地乐观箭矢（视觉，权威箭出现后退役）
   var ghostSeq = -1;
   var ghostFireCd = 0;            // 本地乐观箭的连发节奏
@@ -750,10 +751,14 @@
       for (var i = 0; i < snap.events.length; i++) playEvent(snap.events[i]);
     }
     var now = performance.now();
-    // 统计快照到达间隔：用于自适应插值缓冲（网络越抖，缓冲越大）
+    // 统计快照到达间隔：用于自适应插值缓冲（网络越抖，缓冲越大）。
+    // 同时跟踪"衰减峰值"——缓冲必须能盖住最坏的那次抖动，否则就会冻一帧再跳。
     if (snapArrLast) {
       var gap = now - snapArrLast;
-      if (gap > 5 && gap < 600) snapGapMs += (gap - snapGapMs) * 0.2;
+      if (gap > 5 && gap < 600) {
+        snapGapMs += (gap - snapGapMs) * 0.2;
+        snapGapPeak = Math.max(gap, snapGapPeak * 0.94);
+      }
     }
     snapArrLast = now;
 
@@ -776,9 +781,12 @@
   function buildRenderSnap() {
     if (!lastSnap) return null;
     if (hist.length < 2) return lastSnap;
-    // 自适应插值缓冲：按实测快照到达间隔放大（2.4 倍），并限制在 110~260ms。
-    // 缓冲足够大，渲染时刻才不会越过最新快照 → 对手/箭矢不再"冻结后又跳一下"。
-    var INTERP_MS = Math.max(110, Math.min(260, snapGapMs * 2.4));
+    // 自适应插值缓冲：以"到达间隔的衰减峰值"为准（而不是均值），
+    // 这样即使网络偶发大抖动，渲染时刻也不会越过最新快照 → 对手不会"冻一下再跳"。
+    // 权威端（房主）快照是本地即时的、几乎无抖动，用最小缓冲即可，避免平白多出一截延迟。
+    var INTERP_MS = isAuthority()
+      ? Math.min(40, snapGapMs * 0.75)
+      : Math.max(90, Math.min(260, snapGapPeak * 1.4 + 25));
     var targetT = performance.now() - INTERP_MS;
     // 找 targetT 落在哪两个快照之间（hist 内 t 递增）
     var a = null, b = null;
@@ -792,10 +800,12 @@
         if (hist[j].t > a.t) { b = hist[j]; break; }
       }
     }
-    if (!b) return a.s;
+    // 缓冲用尽（快照还没到）：沿最后已知速度做极短外推，而不是冻在上一帧。
+    // 外推上限 80ms，既避免"冻结顿挫"，也不会飘得太远。
+    if (!b) return extrapolateSnap(a.s, targetT - a.t);
     if (b.t === a.t) return b.s;
     if (targetT <= a.t) return a.s;
-    if (targetT >= b.t) return b.s;
+    if (targetT >= b.t) return extrapolateSnap(b.s, targetT - b.t);
     var t = (targetT - a.t) / (b.t - a.t);
     var s0 = a.s, s1 = b.s; // 两个原始快照
     var out = {
@@ -854,6 +864,40 @@
     while (d > Math.PI) d -= Math.PI * 2;
     while (d < -Math.PI) d += Math.PI * 2;
     return a + d;
+  }
+
+  // 插值缓冲用尽时，沿最后已知速度做极短外推（最多 80ms），
+  // 目的只是"别冻住"，不是精确预测；下一个快照到达就会自动纠正回来。
+  function extrapolateSnap(s, overMs) {
+    var over = overMs / 1000;
+    if (!(over > 0)) return s;
+    if (over > 0.08) over = 0.08;
+    var r = C.BALL_R;
+    var out = {
+      w: s.w, h: s.h, phase: s.phase, phaseT: s.phaseT,
+      round: s.round, winner: s.winner, scores: s.scores,
+      players: [], arrows: [], events: []
+    };
+    for (var i = 0; i < s.players.length; i++) {
+      var p = s.players[i];
+      var nx = p.x + p.vx * over, ny = p.y + p.vy * over;
+      if (nx < r) nx = r; else if (nx > C.W - r) nx = C.W - r;
+      if (ny < r) ny = r; else if (ny > C.H - r) ny = C.H - r;
+      out.players.push({
+        x: nx, y: ny, vx: p.vx, vy: p.vy,
+        hp: p.hp, aim: p.aim, quiver: p.quiver, fireCd: p.fireCd,
+        reloading: p.reloading, reloadT: p.reloadT,
+        boostT: p.boostT, boostCd: p.boostCd, snipeCd: p.snipeCd
+      });
+    }
+    for (var j = 0; j < s.arrows.length; j++) {
+      var a = s.arrows[j];
+      out.arrows.push({
+        x: a.x + a.vx * over, y: a.y + a.vy * over,
+        vx: a.vx, vy: a.vy, owner: a.owner, id: a.id, kill: a.kill
+      });
+    }
+    return out;
   }
 
   /* =========================================================
@@ -1271,6 +1315,7 @@
     lagEst = 0.10;
     snapArrLast = 0;
     snapGapMs = 50;
+    snapGapPeak = 50;
     ghostArrows.length = 0;
     ghostSeq = -1;
     ghostFireCd = 0;
