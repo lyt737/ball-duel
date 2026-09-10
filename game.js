@@ -199,7 +199,12 @@
     matchWin: function () { var n = [523, 659, 784, 1046]; n.forEach(function (f, i) { setTimeout(function () { tone(f, f, 0.18, 0.14, 'triangle'); }, i * 130); }); },
     matchLose: function () { var n = [392, 330, 262, 196]; n.forEach(function (f, i) { setTimeout(function () { tone(f, f * 0.96, 0.2, 0.13, 'triangle'); }, i * 140); }); },
     boost: function () { tone(280, 900, 0.16, 0.12, 'sine'); noise(0.12, 0.08, 3200); },
-    snipe: function () { tone(1400, 2000, 0.08, 0.09, 'square'); noise(0.06, 0.05, 6000); }
+    snipe: function () { tone(1400, 2000, 0.08, 0.09, 'square'); noise(0.06, 0.05, 6000); },
+    // 装弹提示音：箭壶打空时响一下，避免玩家以为"突然打不出"是卡了
+    reload: function (mine) {
+      if (mine) { noise(0.14, 0.07, 1600); tone(240, 150, 0.13, 0.07, 'square'); }
+      else { noise(0.09, 0.022, 1100); }
+    }
   };
 
   // 房主防后台降频：播放一段极低音量持续音，让浏览器认为页面在发声，
@@ -332,8 +337,22 @@
       var map = DOWN[k];
       if (map) keys[map] = false;
     });
-    window.addEventListener('mousemove', function (e) {
+    // 【关键】用 e.buttons（浏览器上报的"当前真实按下的键"）来校准开火状态。
+    // 鼠标每动一下都会自我纠正，因此即使 mouseup / mouseleave / 失焦 漏过一次，
+    // 也只会短暂停一下，继续划动就自动恢复 —— 不会出现"长按突然打不出、必须松手重按"。
+    // e.buttons 第 0 位 = 左键。
+    function syncFireFromButtons(e) {
       mouseCss.x = e.clientX; mouseCss.y = e.clientY; mouseCss.has = true;
+      var pressed = (e.buttons & 1) === 1;
+      if (pressed !== fireDown) {
+        fireDown = pressed;
+        if (!pressed) pushInputNow(); // 松手立即上报，别等下一帧
+      }
+    }
+    window.addEventListener('mousemove', syncFireFromButtons);
+    window.addEventListener('pointermove', function (e) {
+      if (e.pointerType === 'mouse') return; // 鼠标由 mousemove 处理，避免重复
+      syncFireFromButtons(e);
     });
     window.addEventListener('mousedown', function (e) {
       ensureAudio();
@@ -1240,6 +1259,7 @@
   function fmtScore(s) { return s[0] + ' : ' + s[1]; }
   function shortName(i) { return (names && names[i]) || '球手'; }
 
+  var lastReloadFlag = [false, false]; // 用于捕捉"进入装弹"的那一瞬间
   function updateHud(snap) {
     if (!snap) return;
     // 回合结束后快照中的 round 已指向下一局，结算画面按“上一局”显示
@@ -1254,6 +1274,9 @@
         renderQuiver(i, p);
         renderBoostTag(i, p);
         renderSnipeTag(i, p);
+        // 箭壶打空的瞬间响一声：让"打不出"变成可理解的"在装弹"，而不是以为卡了
+        if (p.reloading && !lastReloadFlag[i]) SFX.reload(i === role);
+        lastReloadFlag[i] = !!p.reloading;
       }
     }
   }
@@ -1446,6 +1469,8 @@
     lastSnap = null;
     hist.length = 0;
     resetNetPrediction();
+    resetInputState();
+    lastReloadFlag[0] = lastReloadFlag[1] = false;
     lastPhase = '';
     lastPhaseT = -1;
     practiceGame = null;
