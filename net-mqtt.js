@@ -11,6 +11,12 @@
 
   var PREFIX = 'qiuyingduel2026/';
 
+  // 房主端"远端输入抖动缓冲"的播放延迟（ms）：
+  // 用略大于网络抖动的固定延迟播放房员的输入，把"忽快忽慢的到达"变成平稳输入流。
+  var REMOTE_INPUT_DELAY = 80;
+  // 房主广播快照的节拍（ms）：31Hz 左右，比 20Hz 更跟手、插值缓冲也能更小
+  var TICK_MS = 32;
+
   // 多个公共 broker，按顺序尝试（实测延迟远低于云沙箱）
   var BROKERS = [
     'wss://broker.hivemq.com:8884/mqtt',
@@ -106,6 +112,7 @@
     this.guestPresent = false;
     this.inputs = [newInput(), newInput()];
     this.timer = null;
+    this.mq = []; // 远端移动键的"抖动缓冲"：按到达时间排队，播放时用固定延迟的那一格
   }
 
   HostRoom.prototype.roster = function (forRole) {
@@ -124,6 +131,7 @@
     this.running = true;
     this.onceStarted = true;
     this.inputs = [newInput(), newInput()];
+    this.mq = [];
     var begin = { t: 'begin', names: this.names.slice() };
     this.onMessage(begin); // 本机也要进入对局
     pub(topicOut, begin);
@@ -157,6 +165,13 @@
       inp.fire = !!m.fire;
       inp.boost = !!m.boost;
       inp.snipe = !!m.snipe;
+      // 移动键额外进入抖动缓冲：网络抖动会让消息"忽快忽慢地到"，
+      // 直接照单全收就会变成房员球的急停急走；缓冲后按固定延迟播放，
+      // 输入流变平稳，房主看房员才不会一顿一顿。
+      var mqNow = performance.now();
+      this.mq.push({ t: mqNow, w: !!k.w, a: !!k.a, s: !!k.s, d: !!k.d });
+      while (this.mq.length > 2 && mqNow - this.mq[0].t > 600) this.mq.shift();
+      if (this.mq.length > 80) this.mq.splice(0, this.mq.length - 80);
       return;
     }
     if (m.type === 'leave') {
@@ -195,16 +210,31 @@
     inp.snipe = !!m.snipe;
   };
 
+  // 从抖动缓冲里取出"延迟 REMOTE_INPUT_DELAY 之前那一格"的移动键
+  HostRoom.prototype.pickRemoteKeys = function (now) {
+    if (!this.mq.length) return;
+    var want = now - REMOTE_INPUT_DELAY;
+    var chosen = null, idx = -1;
+    for (var i = this.mq.length - 1; i >= 0; i--) {
+      if (this.mq[i].t <= want) { chosen = this.mq[i]; idx = i; break; }
+    }
+    if (!chosen) { chosen = this.mq[0]; idx = 0; }
+    if (idx > 0) this.mq.splice(0, idx); // 丢弃已播放的，选中的那格留在队首继续用
+    var k = this.inputs[1].k;
+    k.w = chosen.w; k.a = chosen.a; k.s = chosen.s; k.d = chosen.d;
+  };
+
   HostRoom.prototype.tick = function () {
     if (!this.running || !this.game) return;
     if (!this.guestPresent) return;
     // 用"真实经过时间"驱动引擎：定时器被降频/卡顿时，模拟时间仍与真实时间一致，
     // 不会出现"引擎时间落后于现实"导致的双方状态漂移。
     var tickNow = performance.now();
-    var tickDt = this.lastTick ? (tickNow - this.lastTick) / 1000 : 1 / 20;
+    var tickDt = this.lastTick ? (tickNow - this.lastTick) / 1000 : 1 / 30;
     this.lastTick = tickNow;
-    if (!(tickDt > 0)) tickDt = 1 / 20;
+    if (!(tickDt > 0)) tickDt = 1 / 30;
     if (tickDt > 0.05) tickDt = 0.05;
+    this.pickRemoteKeys(tickNow);
     for (var i = 0; i < 2; i++) {
       var k = this.inputs[i].k;
       var dx = (k.d ? 1 : 0) - (k.a ? 1 : 0);
@@ -233,17 +263,17 @@
     if (this.timer) clearInterval(this.timer);
     this.lastTick = 0;
     this.nextTick = 0;
-    // 漂移补偿调度：以 50ms 为节拍基准（定时器 25ms 轮询，精度刚好对齐），
-    // 避免 setInterval(50) 累积误差越来越大导致广播忽快忽慢。
+    // 漂移补偿调度：按 TICK_MS 节拍推进（16ms 轮询对齐 32ms 节拍），
+    // 避免 setInterval 累积误差越来越大导致广播忽快忽慢。
     this.timer = setInterval(function () {
       if (!self.running || !self.game) return;
       var now = performance.now();
       if (!self.nextTick) self.nextTick = now;
-      if (now < self.nextTick - 8) return;
+      if (now < self.nextTick - 6) return;
       if (now - self.nextTick > 250) self.nextTick = now; // 落后太多则重新对齐，不爆发补帧
-      self.nextTick += 50;
+      self.nextTick += TICK_MS;
       self.tick();
-    }, 25);
+    }, 16);
   };
 
   HostRoom.prototype.stop = function () {
