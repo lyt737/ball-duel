@@ -169,15 +169,20 @@
     var dx = opp.x - me.x, dy = opp.y - me.y;
     var dist = Math.sqrt(dx * dx + dy * dy) || 1;
     var ux = dx / dist, uy = dy / dist;
-    var px = -uy, py = ux;
     var t = performance.now() / 1000;
     var radial = dist > 520 ? 1 : (dist < 300 ? -1 : 0);
-    var strafe = Math.sin(t * 1.7);           // 持续横向绕圈，保证画面一直在动
-    var mx = ux * radial + px * strafe;
-    var my = uy * radial + py * strafe;
-    // 只按 8 个方向键（和人手一样），交给既有的输入链路处理
-    keys.d = mx > 0.4; keys.a = mx < -0.4;
-    keys.s = my > 0.4; keys.w = my < -0.4;
+    var ang = t * 1.1;                        // 持续旋转的绕行方向（画面一直在动）
+    var mx = ux * radial + Math.cos(ang) * 0.9;
+    var my = uy * radial + Math.sin(ang) * 0.9;
+    // 映射成 8 个方向键之一（和人手一样），交给既有的输入链路处理。
+    // 关键：一定会有至少一个键按下 —— 否则球会停下不走，
+    // 自测时就出现"看不出卡顿"的死角。
+    var oct = Math.round(Math.atan2(my, mx) / (Math.PI / 4));
+    oct = ((oct % 8) + 8) % 8;
+    var DIRX = [1, 1, 0, -1, -1, -1, 0, 1];
+    var DIRY = [0, 1, 1, 1, 0, -1, -1, -1];
+    keys.d = DIRX[oct] > 0; keys.a = DIRX[oct] < 0;
+    keys.s = DIRY[oct] > 0; keys.w = DIRY[oct] < 0;
     // 瞄准：预判对手位置，再把"准星"换算成屏幕坐标喂给瞄准逻辑
     var lead = dist / C.ARROW_SPEED;
     var tx = opp.x + opp.vx * lead * 0.8;
