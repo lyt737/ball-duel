@@ -62,6 +62,33 @@
     try { client.publish(topic, JSON.stringify(obj), { qos: qos || 0, retain: false }); } catch (e) {}
   }
 
+  /* ---------- 浏览器直连（WebRTC 点对点）----------
+   * 中继只被用来"牵线"（交换一次地址），牵上之后游戏数据全部点对点直达：
+   * 延迟从绕中继的 200~400ms 降到 20~60ms，而且几乎没有抖动。
+   * 不花钱、不用服务器、不用注册账号；任何一步失败都自动退回中继。 */
+  function p2pSend(obj) {
+    return !!(window.P2PNet && window.P2PNet.send(obj));
+  }
+  function p2pStart(isHostPeer, sigTopic) {
+    if (!window.P2PNet || !window.P2PNet.available()) {
+      status('p2p-fail', '浏览器不支持直连，已用中继（可正常玩）');
+      return;
+    }
+    window.P2PNet.init(
+      isHostPeer,
+      function (m) { pub(sigTopic, m); },        // 牵线消息仍走中继
+      function (m) {                             // 对方经由直连发来的游戏消息
+        if (isHostPeer) { if (hostRoom) hostRoom.onGuestMsg(m); }
+        else if (onMessageCb) onMessageCb(m);
+      },
+      function (s, extra) {
+        if (s === 'trying') status('p2p-try', null);
+        else if (s === 'open') status('p2p-ok', null);
+        else status('p2p-fail', extra);
+      }
+    );
+  }
+
   var lastJoinName = ''; // 房员名字：断线重连后要补发一次 join
 
   // 断线后自动重连成功：把房间状态补回来，双方可继续对局
@@ -145,6 +172,8 @@
         if (c !== client) return;
         var m;
         try { m = JSON.parse(payload.toString()); } catch (e) { return; }
+        // 先看是不是"直连牵线"消息（交换地址）；是的话就在这里吃掉
+        if (window.P2PNet && window.P2PNet.handleSignal(m)) return;
         if (isHost && hostRoom) hostRoom.onGuestMsg(m);
         else if (!isHost && onMessageCb) onMessageCb(m);
       });
@@ -166,6 +195,7 @@
     this.inputs = [newInput(), newInput()];
     this.timer = null;
     this.mq = []; // 远端移动键的"抖动缓冲"：按到达时间排队，播放时用固定延迟的那一格
+    this.p2pStarted = false; // 是否已经发起了浏览器直连
     // 对端输入到达间隔统计（用于给房主显示"对方网络抖不抖"）
     this.inGapAvg = 33;
     this.inGapPeak = 33;
@@ -206,6 +236,8 @@
       }
       this.names[1] = String(m.name || '球手').slice(0, 10);
       this.guestPresent = true;
+      // 对方已就位 → 立刻发起浏览器直连（牵线消息走中继，几条而已）
+      if (!this.p2pStarted) { this.p2pStarted = true; p2pStart(true, topicOut); }
       if (!this.running) this.pushLobby(); // 对局中不再打扰
       return;
     }
@@ -353,7 +385,8 @@
     var msg = { t: 'state', s: snap, ht: tickNow };
     // 本机渲染（关键：房主自己也要收到快照）
     this.onMessage(msg);
-    pub(topicOut, msg);
+    // 直连通了就走点对点（延迟最低），否则走中继
+    if (!p2pSend(msg)) pub(topicOut, msg);
   };
 
   HostRoom.prototype.run = function () {
@@ -422,6 +455,8 @@
         // 关键：等订阅成功后再上报 join，否则会错过房主回的房间信息
         c.subscribe(topicOut, function () {
           joinTries = 0;
+          // 先把直连准备好（此刻还没收到 offer，先建好连接对象等着应答）
+          p2pStart(false, topicIn);
           var doJoin = function () {
             pub(topicIn, { type: 'join', name: name });
             joinTries++;
@@ -453,8 +488,9 @@
         }
         return;
       }
-      if (obj.type === 'input') { pub(topicIn, obj); return; }
-      if (obj.type === 'ready') { pub(topicIn, { type: 'ready' }); return; }
+      // 直连通了就走点对点（延迟最低），否则走中继
+      if (obj.type === 'input') { if (!p2pSend(obj)) pub(topicIn, obj); return; }
+      if (obj.type === 'ready') { if (!p2pSend({ type: 'ready' })) pub(topicIn, { type: 'ready' }); return; }
       if (obj.type === 'leave') {
         pub(topicIn, { type: 'leave' });
         try { if (client) client.end(true); } catch (e) {}
@@ -465,6 +501,7 @@
 
     close: function () {
       if (joinTimer) { clearInterval(joinTimer); joinTimer = null; }
+      if (window.P2PNet) window.P2PNet.close(); // 断开直连
       if (hostRoom) { hostRoom.stop(); hostRoom = null; }
       try { if (client) client.end(true); } catch (e) {}
       client = null;
