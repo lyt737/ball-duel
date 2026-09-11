@@ -22,12 +22,23 @@
 
   // 国内可用的公共 STUN（只用来"问出自己的公网地址"，不转发任何数据）。
   // 多填几个，谁能用就用谁。
-  var ICE = [
+  var STUN = [
     { urls: 'stun:stun.miwifi.com:3478' },
     { urls: 'stun:stun.chat.bilibili.com:3478' },
     { urls: 'stun:stun.hitv.com:3478' },
     { urls: 'stun:stun.l.google.com:19302' }
   ];
+  // 免费公共 TURN（Open Relay Project）：**只在点对点打不通时才用**。
+  // 有了它，"运营商 NAT 打不通洞"的情况也能连上（数据经它中转，延迟略高但一定能玩），
+  // 所以它把直连的成功率从"看运气"变成"几乎必定成功"。
+  // 这是公开的免费测试凭据，不需要注册、不需要付费。
+  var TURN = [
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
+  var ICE = STUN.concat(TURN);
 
   var MAX_TRY = 2;      // 最多尝试次数（含首次）
   var GATHER_MS = 6000; // 等 ICE 收集的上限
@@ -41,6 +52,7 @@
   // 最近一次"定论"（成功/失败原因），常驻显示在左上角状态条里，
   // 这样不抓瞬时提示也能看出直连为什么没成（候选 0 = STUN 被挡；有候选 = 打洞失败）
   var lastInfo = '';
+  var pathKind = ''; // 'p2p'（真正的点对点）| 'turn'（经免费 TURN 中转）
 
   function disabled() {
     return (typeof location !== 'undefined') && /[?&]p2p=(off|0)/i.test(location.search);
@@ -74,12 +86,31 @@
     };
   }
 
+  // 判断这次到底走的"点对点"还是"经 TURN 中转"（两者都算连上，但延迟不同）
+  function detectPath() {
+    try {
+      if (!pc || !pc.getStats) return;
+      pc.getStats(null).then(function (rep) {
+        var local = {}, pair = null;
+        rep.forEach(function (r) {
+          if (r.type === 'local-candidate') local[r.id] = r.candidateType || '';
+          if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+        });
+        if (!pair) return;
+        var t = local[pair.localCandidateId] || '';
+        pathKind = (t === 'relay') ? 'turn' : 'p2p';
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
   function wire(channel) {
     dc = channel;
     dc.onopen = function () {
       clearTimeout(timeoutTimer); timeoutTimer = null;
       clearTimeout(retryTimer); retryTimer = null;
       status('open');
+      // 等 1.2 秒让候选配对稳定下来，再判断走的是哪条路
+      setTimeout(detectPath, 1200);
     };
     dc.onmessage = function (ev) {
       if (!peerCb) return;
@@ -207,7 +238,7 @@
     send: send,
     close: close,
     state: function () { return state; },
-    info: function () { return { state: state, detail: lastInfo }; },
+    info: function () { return { state: state, detail: lastInfo, path: pathKind }; },
     available: function () { return supported() && !disabled(); }
   };
 })();
