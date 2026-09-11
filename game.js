@@ -294,6 +294,10 @@
     var ex = extrapN; extrapN = 0;   // 每 0.5 秒汇报一次，理想是 0
     var fr = frameN; frameN = 0;
 
+    // 打着"网络模拟"时，必须一眼看得出来 —— 否则会把自己造的延迟
+    // 当成真实卡顿，白白折腾（这个坑已经坑过一次了）。
+    var simTag = NET.on ? ('⚠ 正在模拟差网络 ' + Math.round(NET.base) + '±' + Math.round(NET.jitter) + 'ms\n') : '';
+
     if (isAuthority()) {
       // 房主：衡量"对方输入到达的抖动"，越大说明对方网络越抖
       var st = (window.MQTTNet && window.MQTTNet.stats) ? window.MQTTNet.stats() : null;
@@ -307,7 +311,7 @@
       else vd = '对方网络很差（中继拥堵）';
       el.className = 'netStat ' + (j < 80 ? 'ok' : (j < 200 ? 'mid' : 'bad'));
       if (p2pOn) head = '直连（点对点）\n';
-      el.textContent = head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
+      el.textContent = simTag + head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
         '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd +
         '\n版本 ' + BUILD;
     } else if (!clkReady) {
@@ -318,7 +322,7 @@
       var cls = (jj < 60 && ex === 0) ? 'ok' : ((jj < 150 && ex < 5) ? 'mid' : 'bad');
       var verdict = cls === 'ok' ? '网络良好' : (cls === 'mid' ? '网络一般（偶有顿挫）' : '网络很差（中继拥堵）');
       el.className = 'netStat ' + cls;
-      el.textContent = head +
+      el.textContent = simTag + head +
         '抖动 ' + jj + 'ms · 间隔 ' + Math.round(snapGapMs) + '/' + Math.round(snapGapPeak) + 'ms' +
         '\n外推 ' + ex + ' / ' + fr + ' 帧 · 画面延迟 ' + Math.round(playoutMs) + 'ms' +
         '\n判定：' + verdict + '\n版本 ' + BUILD;
