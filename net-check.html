@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>网络体检 · 球影对决</title>
+<style>
+  :root { --ink:#0f172a; --line:#e2e8f0; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:22px; font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         color:var(--ink); background:#f8fafc; }
+  .wrap { max-width: 760px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .sub { color:#64748b; font-size:13px; margin-bottom:16px; line-height:1.7; }
+  button { padding:12px 20px; border:0; border-radius:10px; background:#2563eb; color:#fff;
+           font-size:15px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-top:14px; }
+  .verdict { font-size:17px; font-weight:800; padding:14px 16px; border-radius:12px; margin-top:16px; line-height:1.6; }
+  .ok { background:#dcfce7; border:1px solid #86efac; color:#166534; }
+  .mid { background:#fef9c3; border:1px solid #fde68a; color:#854d0e; }
+  .bad { background:#fee2e2; border:1px solid #fecaca; color:#991b1b; }
+  .wait { background:#e2e8f0; color:#334155; }
+  pre { margin:0; font-size:12.5px; line-height:1.75; white-space:pre-wrap; word-break:break-all;
+        font-family: "SF Mono", Consolas, monospace; }
+  .kv { display:grid; grid-template-columns: 130px 1fr; gap:4px 10px; font-size:13px; }
+  .kv b { font-weight:600; color:#475569; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>网络体检 · 直连自检</h1>
+  <div class="sub">
+    这个页面**不做任何联机**，只检查你这台设备/这条网络"能不能做浏览器直连"。<br />
+    手机上也要测一次（手机走流量时最准）。测完把结果截图发给开发即可。
+  </div>
+
+  <button id="go">开始体检（约 10 秒）</button>
+
+  <div class="card">
+    <div class="kv" id="env"></div>
+  </div>
+
+  <div class="card">
+    <pre id="log">等待开始…</pre>
+  </div>
+
+  <div class="verdict wait" id="verdict">尚未开始</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  // 与游戏里完全相同的地址服务器列表
+  var STUN = [
+    { urls: 'stun:stun.miwifi.com:3478' },
+    { urls: 'stun:stun.chat.bilibili.com:3478' },
+    { urls: 'stun:stun.hitv.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' }
+  ];
+  var TURN = [
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
+  var ICE = STUN.concat(TURN);
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var env = $('env'), log = $('log'), vd = $('verdict'), btn = $('go');
+
+  function setEnv() {
+    var ua = navigator.userAgent;
+    var line = [];
+    line.push('<b>浏览器</b><span>' + ua.replace(/</g, '&lt;').slice(0, 110) + '</span>');
+    line.push('<b>安全上下文</b><span>' + (isSecureContext ? 'https / 安全 ✅' : '非安全 ❌') + '</span>');
+    line.push('<b>WebRTC 支持</b><span>' + (window.RTCPeerConnection ? '支持 ✅' : '不支持 ❌（直连不可用）') + '</span>');
+    line.push('<b>当前网络</b><span>' + (navigator.onLine ? '在线' : '离线') +
+      (navigator.connection && navigator.connection.effectiveType ? ' · ' + navigator.connection.effectiveType : '') + '</span>');
+    env.innerHTML = line.join('');
+  }
+
+  function verdict(cls, text) {
+    vd.className = 'verdict ' + cls;
+    vd.innerHTML = text;
+  }
+
+  // 解析候选地址字符串里的类型（host=本机地址 / srflx=公网地址 / relay=中转地址）
+  function candType(s) {
+    var m = / typ ([a-z]+)/.exec(s);
+    return m ? m[1] : '?';
+  }
+  function candProto(s) {
+    if (/ udp /.test(s)) return 'udp';
+    if (/ tcp /.test(s)) return 'tcp';
+    return '?';
+  }
+
+  function run() {
+    if (!window.RTCPeerConnection) { verdict('bad', '这台设备的浏览器不支持 WebRTC，直连不可用（只能走中转服务器）'); return; }
+    btn.disabled = true;
+    log.textContent = '正在收集网络地址…\n';
+    verdict('wait', '体检进行中…（约 10 秒，请保持页面在前台）');
+
+    var pc, cands = [], t0 = performance.now();
+    try {
+      pc = new RTCPeerConnection({ iceServers: ICE });
+    } catch (e) {
+      verdict('bad', '创建直连对象失败：' + e.message + '（很可能是浏览器屏蔽了 WebRTC）');
+      return;
+    }
+
+    pc.onicecandidate = function (e) {
+      if (!e || !e.candidate) return;
+      var c = e.candidate;
+      cands.push({ type: candType(c.candidate), proto: candProto(c.candidate), raw: c.candidate });
+      render();
+    };
+    pc.onicegatheringstatechange = function () { renderStatus(); };
+    pc.onconnectionstatechange = function () { };
+
+    pc.createDataChannel('probe');
+    pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).then(function () {
+      // 最多等 12 秒，或收集完成就收工
+      var timer = setTimeout(finish, 12000);
+      pc.onicegatheringstatechange = function () {
+        renderStatus();
+        if (pc.iceGatheringState === 'complete') { clearTimeout(timer); finish(); }
+      };
+      // DataChannel 打开也不需要（这里只体检地址收集能力）
+    }).catch(function (e) {
+      verdict('bad', '发起失败：' + e.message);
+    });
+  }
+
+  function renderStatus() {
+    var host = cands.filter(function (c) { return c.type === 'host'; }).length;
+    var srflx = cands.filter(function (c) { return c.type === 'srflx'; }).length;
+    var relay = cands.filter(function (c) { return c.type === 'relay'; }).length;
+    log.textContent = '已收集到 ' + cands.length + ' 个地址：本机 ' + host + ' · 公网(STUN) ' + srflx + ' · 中转(TURN) ' + relay +
+      '\n收集状态：' + (pc ? pc.iceGatheringState : '-') + ' · 已用 ' + Math.round(performance.now() - t0) + 'ms\n\n' + render();
+  }
+
+  function render() {
+    var host = cands.filter(function (c) { return c.type === 'host'; }).length;
+    var srflx = cands.filter(function (c) { return c.type === 'srflx'; }).length;
+    var relay = cands.filter(function (c) { return c.type === 'relay'; }).length;
+    var lines = cands.map(function (c, i) {
+      return (i + 1) + '. [' + c.type + '/' + c.proto + '] ' + c.raw;
+    });
+    return '已收集到 ' + cands.length + ' 个地址：本机 ' + host + ' · 公网(STUN) ' + srflx + ' · 中转(TURN) ' + relay +
+      '\n收集状态：' + (pc ? pc.iceGatheringState : '-') + ' · 已用 ' + Math.round(performance.now() - t0) + 'ms\n\n' +
+      (lines.length ? lines.join('\n') : '（还没有任何地址）');
+  }
+
+  function finish() {
+    var host = cands.filter(function (c) { return c.type === 'host'; }).length;
+    var srflx = cands.filter(function (c) { return c.type === 'srflx'; }).length;
+    var relay = cands.filter(function (c) { return c.type === 'relay'; }).length;
+    log.textContent = render();
+    btn.disabled = false;
+
+    if (cands.length === 0) {
+      verdict('bad',
+        '<b>结论：这条网络完全拿不到任何地址 → 直连不可能成功。</b><br />' +
+        '说明浏览器/网络屏蔽了 WebRTC 的地址收集（常见于部分浏览器、公司网、校园网、运营商策略）。<br />' +
+        '对策：必须使用"中转服务器"方案（由服务器转发数据）。');
+    } else if (relay > 0) {
+      verdict('mid',
+        '<b>结论：直连可以工作，且"中转(TURN)兜底"也拿到了地址 ✅</b><br />' +
+        '本机 ' + host + ' · 公网 ' + srflx + ' · 中转 ' + relay + '。<br />' +
+        (srflx > 0
+          ? '有公网地址 → 大多数情况下能<b>点对点直连</b>（最快）。'
+          : '没拿到公网地址（STUN 被挡）→ 但能用<b>TURN 中转</b>连上（稍慢但稳定）。'));
+    } else if (srflx > 0) {
+      verdict('ok',
+        '<b>结论：直连条件良好 ✅</b><br />' +
+        '本机 ' + host + ' · 公网 ' + srflx + ' · 中转 0。<br />' +
+        '如果游戏里还是显示"直连未成功"，问题在对面那台设备（把这份截图也发开发）。');
+    } else if (host > 0) {
+      verdict('mid',
+        '<b>结论：只能拿到本机地址（公网地址没拿到）。</b><br />' +
+        '说明 STUN 被挡（UDP 可能被限制）。<br />' +
+        '同 WiFi 下还有机会直连；跨网络基本需要 TURN 或中转服务器。');
+    } else {
+      verdict('bad', '<b>结论：体检没有拿到可用地址 → 这台设备不适合直连。</b>');
+    }
+
+    // 附上关键环境信息，便于远程判断
+    log.textContent += '\n\n--- 环境 ---\n' + navigator.userAgent +
+      '\n安全上下文: ' + isSecureContext +
+      '\n收集耗时: ' + Math.round(performance.now() - t0) + 'ms';
+  }
+
+  setEnv();
+  btn.addEventListener('click', run);
+})();
+</script>
+</body>
+</html>
