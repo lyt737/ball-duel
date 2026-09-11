@@ -299,9 +299,14 @@
       var st = (window.MQTTNet && window.MQTTNet.stats) ? window.MQTTNet.stats() : null;
       var j = st ? Math.round(st.inGapPeak) : 0;
       var pd = st ? Math.round(st.playDelay || 0) : 0;
-      var vd = j < 80 ? '对方网络良好' : (j < 200 ? '对方网络一般（已自动加大输入缓冲）' : '对方网络很差（中继拥堵）');
+      var p2pOn = !!(window.P2PNet && window.P2PNet.state() === 'open');
+      var vd;
+      if (j < 80) vd = '对方网络良好';
+      else if (p2pOn) vd = '对方输入有停顿（多半是对方窗口被切到后台/被浏览器限流）';
+      else if (j < 200) vd = '对方网络一般（已自动加大输入缓冲）';
+      else vd = '对方网络很差（中继拥堵）';
       el.className = 'netStat ' + (j < 80 ? 'ok' : (j < 200 ? 'mid' : 'bad'));
-      if (window.P2PNet && window.P2PNet.state() === 'open') head = '直连（点对点）\n';
+      if (p2pOn) head = '直连（点对点）\n';
       el.textContent = head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
         '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd +
         '\n版本 ' + BUILD;
@@ -1186,7 +1191,9 @@
       //   太小 → 数据经常不够 → 外推 → 一顿一顿；太大 → 平白多出一截延迟。
       // 注意：它只由实测抖动决定，**绝不再因为发生外推而往上加** ——
       // 那会形成"越卡越加、越加越卡"的正反馈（上一版就是这样涨到了 611ms）。
-      var want = Math.max(70, Math.min(400, clkJitter * 1.6 + T * 1.2));
+      // 下限 55ms ≈ 1.7 个主机节拍，足够保证"渲染时刻永远落在两个快照之间"；
+      // 直连时抖动常常只有 1~5ms，这个下限就是画面延迟的主要部分，所以压低它 = 更跟手
+      var want = Math.max(55, Math.min(400, clkJitter * 1.6 + T * 0.9));
       if (!playReady) { playT = newestE.ht - want; playReady = true; }
 
       // —— 播放时钟：按真实时间 1:1 前进，只用极小速率修正追平偏差 ——
@@ -1943,15 +1950,17 @@
       if (helpEl) helpEl.innerHTML += '<br /><span style="opacity:.55">版本 ' + BUILD + '</span>';
     } catch (e) {}
 
-    // 房主切后台会让双方卡：回到前台时提醒
+    // 浏览器会对"后台标签页"限流（画面停帧、定时器降到 1 次/秒）：
+    //   房主页切后台 → 双方都卡；
+    //   房员页切后台 → 房主看你就是"一顿一顿"（这条最容易被误判成网络问题）。
+    // 直连模式下同样如此，所以对两边都提醒。
     var hiddenDuringPlay = false;
     document.addEventListener('visibilitychange', function () {
-      var isMqttHost = (netKind === 'mqtt' && window.MQTTNet && window.MQTTNet.isHost());
       if (document.hidden) {
-        if (mode === 'online' && isMqttHost) hiddenDuringPlay = true;
+        if (mode === 'online' && inPlay) hiddenDuringPlay = true;
       } else if (hiddenDuringPlay) {
         hiddenDuringPlay = false;
-        showToast('检测到房主页面切到后台——这会让双方卡顿，请保持本页在前台', 4200);
+        showToast('刚才本页被切到后台——浏览器会限流（画面和操作都会卡），请保持游戏窗口在前台', 4600);
       }
     });
 
