@@ -38,6 +38,9 @@
   var state = 'idle';   // idle | trying | open | failed | closed
   var timeoutTimer = null, retryTimer = null;
   var started = false, attempt = 0, cand = 0;
+  // 最近一次"定论"（成功/失败原因），常驻显示在左上角状态条里，
+  // 这样不抓瞬时提示也能看出直连为什么没成（候选 0 = STUN 被挡；有候选 = 打洞失败）
+  var lastInfo = '';
 
   function disabled() {
     return (typeof location !== 'undefined') && /[?&]p2p=(off|0)/i.test(location.search);
@@ -47,6 +50,10 @@
   }
   function status(s, extra) {
     state = s;
+    // 只有"成功/失败/关闭"才算定论；'trying' 时保留上一次的原因，便于排查
+    if (s === 'failed' || s === 'open' || s === 'closed') {
+      lastInfo = extra || (s === 'open' ? '已直连' : '');
+    }
     if (stCb) { try { stCb(s, extra); } catch (e) {} }
   }
 
@@ -200,6 +207,7 @@
     send: send,
     close: close,
     state: function () { return state; },
+    info: function () { return { state: state, detail: lastInfo }; },
     available: function () { return supported() && !disabled(); }
   };
 })();
