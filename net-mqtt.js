@@ -71,7 +71,7 @@
   }
   function p2pStart(isHostPeer, sigTopic) {
     if (!window.P2PNet || !window.P2PNet.available()) {
-      status('p2p-fail', '浏览器不支持直连，已用中继（可正常玩）');
+      status('p2p-fail', window.P2PNet ? '本窗口未启用直连' : '直连模块未加载');
       return;
     }
     window.P2PNet.init(
