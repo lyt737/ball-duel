@@ -239,6 +239,18 @@
     else if (s === 'lost') { netTip('与中继的连接中断，正在自动重连…', 'err'); showToast('网络中断，正在自动重连…', 4000); }
     else if (s === 'retry') { netTip('正在重连中继…', ''); }
     else if (s === 'back') { netTip('已重新连接中继，可继续对战', 'ok'); showToast('已重新连接，对阵可以继续了', 3000); }
+    // —— 浏览器直连（点对点）——
+    // 成功 = 数据不再经过公共中继，延迟从 200~400ms 降到 20~60ms；
+    // 失败 = 自动切回中继，照常能玩，不会比现在更差。
+    else if (s === 'p2p-try') netTip('正在尝试浏览器直连（点对点）…', '');
+    else if (s === 'p2p-ok') {
+      netTip('已建立浏览器直连：数据不再经过公共中继，延迟最低', 'ok');
+      showToast('直连成功！现在两人直接互连，不走中继了', 3400);
+    }
+    else if (s === 'p2p-fail') {
+      netTip('直连不可用，已自动切回公共中继（照常能玩）', 'err');
+      showToast('直连未成功（' + (extra || '') + '），已切回中继模式', 3800);
+    }
     else if (s === 'waitjoin') {
       netTip('已连上中继，但还没收到房间信息…', 'err');
       showToast('8 秒未收到房间信息：① 确认房间号是否正确 ② 让对方保持页面在前台 ③ 双方中继名字要一致', 6000);
@@ -277,6 +289,8 @@
     }
 
     var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
+    // 直连成功时明确显示出来 —— 这才代表"数据没走中继"
+    if (window.P2PNet && window.P2PNet.state() === 'open') head = '直连（点对点）\n';
     var ex = extrapN; extrapN = 0;   // 每 0.5 秒汇报一次，理想是 0
     var fr = frameN; frameN = 0;
 
@@ -287,6 +301,7 @@
       var pd = st ? Math.round(st.playDelay || 0) : 0;
       var vd = j < 80 ? '对方网络良好' : (j < 200 ? '对方网络一般（已自动加大输入缓冲）' : '对方网络很差（中继拥堵）');
       el.className = 'netStat ' + (j < 80 ? 'ok' : (j < 200 ? 'mid' : 'bad'));
+      if (window.P2PNet && window.P2PNet.state() === 'open') head = '直连（点对点）\n';
       el.textContent = head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
         '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd +
         '\n版本 ' + BUILD;
