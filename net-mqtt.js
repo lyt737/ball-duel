@@ -337,7 +337,8 @@
   // 上限 300ms，避免房员的操作变得太迟钝。
   HostRoom.prototype.pickRemoteKeys = function (now) {
     if (!this.mq.length) return;
-    var delay = Math.max(REMOTE_INPUT_DELAY, Math.min(300, this.inGapPeak * 0.8));
+    // 上限 420ms：中继抖动很大时，宁可让对方的动作慢一点，也不要"忽停忽走"
+    var delay = Math.max(REMOTE_INPUT_DELAY, Math.min(420, this.inGapPeak * 0.8));
     this.playDelay = delay;
     var want = now - delay;
     var chosen = null, idx = -1;
