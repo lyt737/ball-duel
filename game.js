@@ -116,6 +116,56 @@
       /^192\.168\./.test(h) || /^10\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
   }
 
+  /* ---------- 自建服务器自动识别 ----------
+   * 部署到自己的服务器（server.js）后，玩家直接打开 http://服务器IP:3000/ 即可：
+   * 页面里不需要加任何参数。启动时探测一下"同源 WebSocket 是否可用"：
+   *   可用   → 走自建服务器（服务端权威 + 无抖动时间戳，延迟最低）
+   *   不可用 → 退回公共中继（GitHub Pages 上就是这种情况）
+   * 这样"自建版"和"公网版"用同一份代码，不需要人工切换。
+   */
+  var serverMode = null; // null=未知 | 'ws'=自建服务器 | 'mqtt'=公共中继
+  function preferWs() { return serverMode === 'ws'; }
+  // 是否走公共中继：只有在"没有自建服务器"时才用
+  function useMqttPath() { return forceMqtt() || !(preferWs() || isLocalHost()); }
+
+  function detectServer() {
+    return new Promise(function (resolve) {
+      var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      var probe;
+      try { probe = new WebSocket(proto + '://' + location.host); } catch (e) { resolve(false); return; }
+      var done = false;
+      var t = setTimeout(function () { finish(false); }, 2500);
+      function finish(ok) {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        if (ok) {
+          serverMode = 'ws';
+          resolve(true);
+        } else {
+          try { probe.close(); } catch (e) {}
+          resolve(false);
+        }
+      }
+      probe.onopen = function () {
+        finish(true);
+        // 探测成功：把这个连接留给后续使用（避免重复握手）
+        ws = probe;
+        ws.onopen = function () { netTip('已连接自建服务器，可创建/加入房间', 'ok'); };
+        ws.onmessage = function (ev) {
+          var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+          onMsgFromNet(m);
+        };
+        ws.onclose = function () {
+          netTip('与服务器的连接已断开，请刷新页面重试', 'err');
+          if (mode === 'online') backToMenu(true);
+          ws = null;
+        };
+      };
+      probe.onerror = function () { finish(false); };
+    });
+  }
+
   /* ---------- 版本标记 ----------
    * 部署脚本会在给 game.js 的地址加上 ?v=时间戳，这里把它读出来、
    * 显示在左上角状态条和主菜单上 —— 以后任何截图都能一眼确认
@@ -1056,7 +1106,7 @@
     var name = setNameOfInput();
     // 公网静态部署（如 GitHub Pages）用公共中继；本地/局域网用自建服务器。
     // ?net=mqtt 可在本地也强制走公共中继（自测用，复现与线上完全相同的代码路径）
-    if ((forceMqtt() || !isLocalHost()) && window.MQTTNet) {
+    if (useMqttPath() && window.MQTTNet) {
       netKind = 'mqtt';
       netTip('正在连接公共中继…', '');
       startHostKeepAlive(); // 房主：防止切后台被浏览器降频
@@ -1072,7 +1122,7 @@
     var code = $('roomIn').value.trim().toUpperCase();
     if (!code) { showToast('请输入房间号'); return; }
     var name = setNameOfInput();
-    if ((forceMqtt() || !isLocalHost()) && window.MQTTNet) {
+    if (useMqttPath() && window.MQTTNet) {
       netKind = 'mqtt';
       netTip('正在连接公共中继…', '');
       window.MQTTNet.join(code, name, onMsgFromNet, onNetStatus);
@@ -1985,11 +2035,31 @@
     if (roomParam) $('roomIn').value = roomParam.toUpperCase();
 
     if (isLocalHost() && !forceMqtt()) {
-      // 本地/局域网：连自建服务器
+      // 本地/局域网：直接连自建服务器
       connect();
+    } else if (!forceMqtt()) {
+      // 公网部署：先探测"同源自建服务器"——有就用它（专属、低延迟、不抖），
+      // 没有就自动退回公共中继。玩家不用懂、也不用加任何参数。
+      netTip('正在检测联机服务器…', '');
+      detectServer().then(function (ok) {
+        if (ok) {
+          netTip('已连接专属服务器：延迟最低，数据不经过公共中继', 'ok');
+          if (roomParam) {
+            wsSend({ type: 'join', code: roomParam.trim().toUpperCase(), name: setNameOfInput() });
+          }
+        } else {
+          netTip('公共中继模式（公网静态版）：创建/加入房间走公共中继，无需自建服务器', 'ok');
+          if (roomParam && window.MQTTNet) {
+            setTimeout(function () {
+              netKind = 'mqtt';
+              window.MQTTNet.join(roomParam.trim().toUpperCase(), setNameOfInput(), onMsgFromNet, onNetStatus);
+            }, 300);
+          }
+        }
+      });
     } else {
-      netTip('公共中继模式（公网静态版）：创建/加入房间走公共中继，无需自建服务器', 'ok');
-      // 通过邀请链接进入：自动加入房间
+      // 强制公共中继（?net=mqtt，自测用）
+      netTip('公共中继模式（手动指定）', 'ok');
       if (roomParam && window.MQTTNet) {
         setTimeout(function () {
           netKind = 'mqtt';
