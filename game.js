@@ -27,7 +27,7 @@
   var prevSnapObj = null;
   // 网络插值：保存最近若干快照及各自本地到达时间（20Hz 服务端下需留足够缓冲）
   var hist = []; // [{s, t, ht?}] t=到达时间；ht=主机时间戳（有则优先，时间轴无抖动）
-  var histMax = 20;
+  var histMax = 30; // 历史窗口要盖过播放缓冲（30 × 31ms ≈ 930ms）
   var lastPhase = '';
   var lastPhaseT = -1;
   var inPlay = false;
@@ -42,13 +42,18 @@
   var clkJitter = 0;     // 窗口内 90 分位的额外延迟
   var clkReady = false;
   var histClock = '';    // 'host' | 'arrival'：时间轴口径，切换时清空历史
-  // 自适应播放缓冲（ms）：房员把对手"回放"到多久之前。
-  // 太小 → 缓冲不够，只能靠外推 → 一卡一跳；太大 → 对手慢半拍。
-  // 这里让它自己测：一旦发现缓冲不够就立刻加大，长期不紧张就慢慢减小。
+  // 播放缓冲（ms）：房员把对手"回放"到多久之前。大小只由"实测抖动"决定。
   var playoutMs = 110;
-  var extrapN = 0;       // 近段统计：有多少帧"缓冲不够、只能外推"（越少越顺，0 最理想）
+  var extrapN = 0;       // 近段统计：有多少帧"数据不够、只能外推"（越少越顺，0 最理想）
   var frameN = 0;        // 近段统计：渲染了多少帧（配合外推数判断严重程度）
-  var behindExtra = 0;   // 兜底自增缓冲：发生外推就抬高，长期平稳就缓慢收回
+  /* —— 播放时钟（"卡到爆"的正解）——
+   * 渲染时刻绝不能"锚定在最新快照的到达时间"上：那样每一次到达的抖动都会
+   * 直接注入画面（快照晚到 → 画面往前冲；快照一到 → 又往回跳）。
+   * 正确做法和音视频播放器一致：用一个自己走的时钟，按真实时间 1:1 前进，
+   * 只在偏差较大时做极小速率微调，永不跳变。 */
+  var playT = 0;         // 播放时刻（主机时间轴，ms）
+  var playReady = false;
+  var snapHostInt = 0;   // 主机快照间隔估计（房主按固定节拍产出，基本恒定，ms）
 
   /* ---------- 联机非权威端：自身球本地连续模拟（根治"走一步又弹回"） ----------
    * 原理：权威端与本地用同一套移动公式、同一份输入，只是相差一个网络延迟。
@@ -260,9 +265,11 @@
       // 房主：衡量"对方输入到达的抖动"，越大说明对方网络越抖
       var st = (window.MQTTNet && window.MQTTNet.stats) ? window.MQTTNet.stats() : null;
       var j = st ? Math.round(st.inGapPeak) : 0;
-      var vd = j < 60 ? '对方网络良好' : (j < 150 ? '对方网络一般' : '对方网络很差');
-      el.className = 'netStat ' + (j < 60 ? 'ok' : (j < 150 ? 'mid' : 'bad'));
-      el.textContent = head + '对方抖动 ' + j + 'ms · 我方间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd;
+      var pd = st ? Math.round(st.playDelay || 0) : 0;
+      var vd = j < 80 ? '对方网络良好' : (j < 200 ? '对方网络一般（已自动加大输入缓冲）' : '对方网络很差（中继拥堵）');
+      el.className = 'netStat ' + (j < 80 ? 'ok' : (j < 200 ? 'mid' : 'bad'));
+      el.textContent = head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
+        '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd;
     } else if (!clkReady) {
       el.className = 'netStat mid';
       el.textContent = head + '正在测量网络…';
@@ -273,7 +280,7 @@
       el.className = 'netStat ' + cls;
       el.textContent = head +
         '抖动 ' + jj + 'ms · 间隔 ' + Math.round(snapGapMs) + '/' + Math.round(snapGapPeak) + 'ms' +
-        '\n外推 ' + ex + ' / ' + fr + ' 帧 · 缓冲 ' + Math.round(playoutMs) + 'ms' +
+        '\n外推 ' + ex + ' / ' + fr + ' 帧 · 画面延迟 ' + Math.round(playoutMs) + 'ms' +
         '\n判定：' + verdict;
     }
   }
@@ -761,7 +768,9 @@
       y: by + Math.sin(aim) * (C.BALL_R + 22),
       vx: Math.cos(aim) * C.ARROW_SPEED,
       vy: Math.sin(aim) * C.ARROW_SPEED,
-      owner: role, life: 1.1, kill: false
+      // 寿命放宽到 2.6s：飞行途中不会被"寿命到期"提前抹掉
+      // （真正退役靠权威箭到达，见 retireGhosts）
+      owner: role, life: 2.6, kill: false
     });
     while (ghostArrows.length > 8) ghostArrows.shift();
   }
@@ -795,9 +804,11 @@
 
     if (fireDown && base && me && base.phase === 'playing' && ghostFireCd <= 0 &&
       ghostLocalQuiver > 0 && ghostReloadT <= 0) {
-      // 用"权威位置 + 权威朝向"生成虚影：这样它和稍后到达的真箭几乎重合，
-      // 真箭一出现把虚影退役时不会"跳一下"。
-      spawnGhostArrow(me.x, me.y, me.aim);
+      // 用"本机球此刻的位置 + 本机瞄准"生成虚影 —— 它必须从"你看到的球"飞出来。
+      // （若用权威快照位置，会差一整个网络往返 + 播放缓冲的时间，
+      //   表现就是"弓箭从另外一个地方射出来"。）
+      var src = ownSim || me;
+      spawnGhostArrow(src.x, src.y, aimAngle());
       ghostLocalQuiver--;
       ghostFireCd = C.FIRE_CD;
     }
@@ -952,6 +963,21 @@
     } else {
       hint.innerHTML = '将房间号 <b style="letter-spacing:2px">' + m.code + '</b> 或邀请链接发给朋友。<br/>对方加入后，双方点「准备」即可开战。' + hostNote;
     }
+
+    // 自测台：把"带全部参数的完整链接"直接显示出来。
+    // 复制到第二个窗口打开，两边条件才完全一致（少复制参数会导致一边没开模拟）。
+    if (NET.on || autoPlay || autoHost || forceMqtt()) {
+      var qs2 = new URLSearchParams(location.search);
+      var ex2 = '';
+      ['net', 'lag', 'auto'].forEach(function (kk) { // 注意：不带 host，第二个窗口不能自己建房
+        var vv = qs2.get(kk);
+        if (vv) ex2 += '&amp;' + kk + '=' + encodeURIComponent(vv);
+      });
+      hint.innerHTML += '<div style="margin-top:10px;font-size:12px;line-height:1.7;text-align:left;' +
+        'word-break:break-all;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:10px">' +
+        '<b>自测台已开启。</b>把下面这一整行复制到<b>第二个窗口</b>打开（两个窗口都必须带参数）：<br/>' +
+        '<b>' + esc(location.origin + location.pathname + '?room=' + m.code + ex2) + '</b></div>';
+    }
     // 关键：对局进行中收到大厅刷新（如对方重试 join）时，绝不能把玩家踢回大厅界面。
     // 反过来，只要还没拿到对局数据（lastSnap 为空），就必须切到房间界面，
     // 否则会出现"房主看得到我、我却卡在菜单、准备不了"。
@@ -1054,8 +1080,8 @@
     if (mode === 'online') {
       var entry = { s: snap, t: now };
       if (useHost) entry.ht = hostT;
-      hist.push(entry);
-      if (hist.length > histMax) hist.shift();
+      // 有序插入（网络可能乱序到达，见 insertHist 的说明）
+      insertHist(entry, useHost ? 'ht' : 't');
       // 非权威端：用权威快照校准本地自身模拟（延迟对齐 + 温和纠偏，绝不瞬移）
       reconcileOwn(snap);
       retireGhosts(snap);
@@ -1067,35 +1093,76 @@
     updateHud(snap);
   }
 
+  /* 把快照按"时间轴有序"插入历史。
+   * 网络是可能乱序的（后发的先到、抖动越大越常见），而插值必须建立在
+   * 有序的时间轴上 —— 否则"找相邻两帧"会找错，渲染时刻就会乱跳
+   * （表现：卡到爆、箭一次冒出来七八支）。 */
+  function insertHist(entry, key) {
+    var k = entry[key];
+    if (typeof k !== 'number') { hist.push(entry); }
+    else {
+      var n = hist.length;
+      if (n === 0 || k >= hist[n - 1][key]) {
+        hist.push(entry);
+      } else {
+        var i = n - 1;
+        while (i >= 0 && hist[i][key] > k) i--;
+        hist.splice(i + 1, 0, entry);
+      }
+    }
+    if (hist.length > histMax) hist.shift();
+  }
+
   // 在最近历史快照之间插值：对手与箭矢平滑；自己另用本地预测覆盖。
-  function buildRenderSnap() {
+  // dt：本帧时长（秒）——播放时钟按它前进。
+  function buildRenderSnap(dt) {
     if (!lastSnap) return null;
-    if (hist.length < 2) return lastSnap;
+    if (hist.length < 2) { playReady = false; return lastSnap; }
 
     var useHost = (histClock === 'host') && clkReady;
     var key, targetT;
     if (useHost) {
-      // —— 无抖动时间线（锚定在最新快照，绝不再比两台机器的绝对时钟）——
-      // 渲染点 = 最新快照的主机时间戳 + 本机已经过去的时间 − 落后量
-      //   ① 时间轴上只有等间隔的主机时间戳 → 天然平滑，完全不受网络抖动影响；
-      //   ② 只要 behind ≥ 一次到达间隔，渲染点就永远落在两个已知快照之间，
-      //      不会跌进"外推"（外推 = 一卡一跳的根源）；
-      //   ③ 全程只用"本机时钟的差值"，不比较两机绝对时钟 → 不存在时钟原点不一致的问题。
       key = 'ht';
       var newestE = hist[hist.length - 1];
-      // 1.55 倍是实测出来的折中；behindExtra 是"兜底自增"：
-      // 一旦真的发生外推，就把缓冲永久抬高一点，保证同样的坑不会踩第二次。
-      var behind = Math.max(45, snapGapPeak * 1.55) + behindExtra;
-      behindExtra = Math.max(0, behindExtra - 0.15); // 缓慢回落，长期不紧张就收回去
-      playoutMs = behind; // 仅用于左上角显示
-      targetT = newestE.ht + (performance.now() - newestE.t) - behind;
+      var oldestE = hist[0];
+
+      // 主机节拍间隔（房主按固定节拍产出，相邻 ht 的差值基本恒定）
+      if (hist.length >= 3) {
+        var d0 = newestE.ht - hist[hist.length - 2].ht;
+        if (d0 > 4 && d0 < 200) snapHostInt = snapHostInt ? (snapHostInt * 0.8 + d0 * 0.2) : d0;
+      }
+      var T = snapHostInt || 32;
+
+      // 播放缓冲：盖住"实测抖动（90 分位）"，再多留一帧余量。
+      //   太小 → 数据经常不够 → 外推 → 一顿一顿；太大 → 平白多出一截延迟。
+      // 注意：它只由实测抖动决定，**绝不再因为发生外推而往上加** ——
+      // 那会形成"越卡越加、越加越卡"的正反馈（上一版就是这样涨到了 611ms）。
+      var want = Math.max(70, Math.min(400, clkJitter * 1.6 + T * 1.2));
+      if (!playReady) { playT = newestE.ht - want; playReady = true; }
+
+      // —— 播放时钟：按真实时间 1:1 前进，只用极小速率修正追平偏差 ——
+      // 这一条是"平滑"的根本：无论快照忽早忽晚到达，画面都不会跳。
+      var err = (newestE.ht - want) - playT;   // >0：播放落后了，需要稍微追快
+      var rate = 1;
+      if (err > 0) rate = 1 + Math.min(0.08, err / 800);
+      else if (err < 0) rate = 1 - Math.min(0.08, -err / 800);
+      playT += (dt > 0 ? dt : 0.016) * 1000 * rate;
+
+      // 边界：最多外推 150ms（数据迟到时沿速度继续走，而不是"冻住"）；
+      //       也不能退到历史窗口之外（否则画面会卡在最老的一帧上）。
+      if (playT > newestE.ht + 150) playT = newestE.ht + 150;
+      if (playT < oldestE.ht) playT = oldestE.ht;
+      targetT = playT;
+      playoutMs = newestE.ht - playT; // 显示：画面实际落后多少（真实延迟）
     } else {
       // 拿不到主机时间戳（老协议/自建服务器）：退回按"到达时间"插值
+      playReady = false;
       key = 't';
       var INTERP_MS = isAuthority()
         ? Math.min(40, snapGapMs * 0.75)
         : Math.max(90, Math.min(260, snapGapPeak * 1.4 + 25));
       targetT = performance.now() - INTERP_MS;
+      playoutMs = INTERP_MS;
     }
 
     // 找 targetT 落在哪两个快照之间（hist 内该坐标轴单调递增）
@@ -1110,21 +1177,13 @@
         if (hist[j][key] > a[key]) { b = hist[j]; break; }
       }
     }
-    // 缓冲用尽（快照还没到）：沿最后已知速度做极短外推，而不是冻在上一帧。
-    // 外推上限 80ms，既避免"冻结顿挫"，也不会飘得太远。
-    if (!b) {
-      // 真的没有更新的快照可用 → 记下超出量，把缓冲永久抬高一点，保证不反复踩坑
-      var overMs = targetT - a[key];
-      if (overMs > 0) behindExtra = Math.min(500, behindExtra + Math.min(overMs, 80));
-      return extrapolateSnap(a.s, overMs);
-    }
+    // 数据不够（快照还没到）：沿最后已知速度做极短外推，而不是冻在上一帧。
+    // 播放时钟保证了"正常情况下渲染时刻永远落在两个已知快照之间"，
+    // 所以这里只在网络真的停顿时才会走到，属于少数情况。
+    if (!b) return extrapolateSnap(a.s, targetT - a[key]);
     if (b[key] === a[key]) return b.s;
     if (targetT <= a[key]) return a.s;
-    if (targetT >= b[key]) {
-      var overMs2 = targetT - b[key];
-      if (overMs2 > 0) behindExtra = Math.min(500, behindExtra + Math.min(overMs2, 80));
-      return extrapolateSnap(b.s, overMs2);
-    }
+    if (targetT >= b[key]) return extrapolateSnap(b.s, targetT - b[key]);
     var t = (targetT - a[key]) / (b[key] - a[key]);
     var s0 = a.s, s1 = b.s; // 两个原始快照
     var out = {
@@ -1654,7 +1713,7 @@
 
     if (lastSnap && inPlay) {
       var w = mouseCss.has ? R.toWorld(mouseCss.x, mouseCss.y) : null;
-      var renderSnap = (mode === 'online') ? buildRenderSnap() : lastSnap;
+      var renderSnap = (mode === 'online') ? buildRenderSnap(dt) : lastSnap;
 
       if (renderSnap && mode === 'online') {
         // 本地乐观箭矢（自己刚射出的箭立刻可见）
@@ -1707,7 +1766,9 @@
     clkReady = false;
     histClock = '';
     playoutMs = 110;
-    behindExtra = 0;
+    playT = 0;
+    playReady = false;
+    snapHostInt = 0;
     extrapN = 0;
     frameN = 0;
     frameMsSum = 0; frameMsN = 0; frameMsMax = 0;
