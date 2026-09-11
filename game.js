@@ -111,9 +111,89 @@
       /^192\.168\./.test(h) || /^10\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
   }
 
+  /* =========================================================
+   *   自测台（全部挂在网址参数上，正常游玩不受任何影响）
+   *   ?lag=120,60,2   网络模拟：单程延迟 120ms、抖动 ±60ms、丢包 2%
+   *   ?auto=1         自动代打：本机玩家交给程序操作，一个人开两个窗口就能对打
+   *   ?net=mqtt       本地/局域网也强制走公共中继（复现与线上完全相同的代码路径）
+   *   例：https://.../ball-duel/?lag=150,80&auto=1
+   *   目的：不用再约同学，一个人就能复现"房员看房主卡"这类问题。
+   * ========================================================= */
+  var NET = { on: false, base: 0, jitter: 0, loss: 0 };
+  var autoPlay = /[?&]auto=1/.test(location.search);
+  var autoHost = /[?&]host=1/.test(location.search); // 自动建房（配合 ?auto=1 可做到"零点击"开一局）
+  var autoReadySent = false;
+  function forceMqtt() { return /[?&]net=mqtt/.test(location.search); }
+
+  (function parseNetSim() {
+    var m = /[?&]lag=([^&]*)/.exec(location.search);
+    if (!m) return;
+    var p = decodeURIComponent(m[1]).split(',');
+    var b = parseFloat(p[0]);
+    var j = parseFloat(p[1] || '0');
+    var l = parseFloat(p[2] || '0');
+    if (!(b >= 0)) return; // 没写延迟就不启用
+    NET.on = true;
+    NET.base = Math.min(2000, b);
+    NET.jitter = Math.max(0, Math.min(2000, isFinite(j) ? j : 0));
+    NET.loss = Math.max(0, Math.min(90, isFinite(l) ? l : 0));
+  })();
+
+  function netSimDesc() {
+    return '单程 ' + Math.round(NET.base) + 'ms' +
+      (NET.jitter ? ' ±' + Math.round(NET.jitter) + 'ms' : '') +
+      (NET.loss ? ' 丢包 ' + NET.loss + '%' : '');
+  }
+
+  // 让这条消息"在路上走一会儿"（含抖动与丢包），用来模拟真实的公网中继
+  function netDelay(fn) {
+    if (!NET.on) { fn(); return; }
+    if (NET.loss > 0 && Math.random() * 100 < NET.loss) return; // 模拟丢包
+    setTimeout(fn, NET.base + Math.random() * NET.jitter);
+  }
+
+  // 收到的消息先"上路"，再交给正常处理（模拟下行延迟）
+  function onMsgFromNet(m) {
+    if (!NET.on) { onServerMsg(m); return; }
+    netDelay(function () { onServerMsg(m); });
+  }
+
+  /* ---------- 自动代打（?auto=1）：由程序操作本机玩家 ----------
+   * 走的是和人手完全相同的输入链路（方向键 + 准星 + 开火），
+   * 所以两个窗口各自开一个，就能自动对打，用来观察"对手画面卡不卡"。 */
+  function autoInput() {
+    if (!lastSnap || role == null) return;
+    var me = ownSim || lastSnap.players[role];
+    var opp = lastSnap.players[role === 0 ? 1 : 0];
+    if (!me || !opp) return;
+    var dx = opp.x - me.x, dy = opp.y - me.y;
+    var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    var ux = dx / dist, uy = dy / dist;
+    var px = -uy, py = ux;
+    var t = performance.now() / 1000;
+    var radial = dist > 520 ? 1 : (dist < 300 ? -1 : 0);
+    var strafe = Math.sin(t * 1.7);           // 持续横向绕圈，保证画面一直在动
+    var mx = ux * radial + px * strafe;
+    var my = uy * radial + py * strafe;
+    // 只按 8 个方向键（和人手一样），交给既有的输入链路处理
+    keys.d = mx > 0.4; keys.a = mx < -0.4;
+    keys.s = my > 0.4; keys.w = my < -0.4;
+    // 瞄准：预判对手位置，再把"准星"换算成屏幕坐标喂给瞄准逻辑
+    var lead = dist / C.ARROW_SPEED;
+    var tx = opp.x + opp.vx * lead * 0.8;
+    var ty = opp.y + opp.vy * lead * 0.8;
+    var s = R.toScreen(tx, ty);
+    mouseCss.x = s.x; mouseCss.y = s.y; mouseCss.has = true;
+    fireDown = dist > 120 && dist < 1500;
+  }
+
   // 统一发送入口：自动选择 WS 或 MQTT
   function netSend(obj) {
-    if (netKind === 'mqtt' && window.MQTTNet) { window.MQTTNet.send(obj); return true; }
+    if (netKind === 'mqtt' && window.MQTTNet) {
+      // 上行也走网络模拟（输入消息延迟到达，正是"房主看房员急停急走"的成因）
+      netDelay(function () { window.MQTTNet.send(obj); });
+      return true;
+    }
     return wsSend(obj);
   }
 
@@ -330,6 +410,9 @@
   }
   function setNameOfInput() {
     var n = $('nameIn').value.trim();
+    // 自测台：同一台电脑的两个窗口共用 localStorage 里的昵称，
+    // 加个随机后缀，方便一眼分清哪个窗口是房主、哪个是房员（也不污染保存的昵称）
+    if (autoPlay || autoHost) return (n || '测试球手') + '#' + Math.floor(100 + Math.random() * 900);
     if (!n) n = '神秘球手' + Math.floor(100 + Math.random() * 900);
     try { localStorage.setItem('qyj_name', n); } catch (e) {}
     return n;
@@ -563,7 +646,7 @@
     };
     ws.onmessage = function (ev) {
       var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-      onServerMsg(m);
+      onMsgFromNet(m); // 经过网络模拟（下行延迟/抖动/丢包）
     };
     ws.onclose = function () {
       netTip('未能连接到服务器。可以先玩“本地练习”；启动联机请运行 node server.js', 'err');
@@ -575,6 +658,12 @@
 
   function wsSend(obj) {
     var str = JSON.stringify(obj);
+    if (!NET.on) return wsSendNow(str);
+    // 上行也走网络模拟（本地自测时用）
+    netDelay(function () { wsSendNow(str); });
+    return true;
+  }
+  function wsSendNow(str) {
     if (ws && ws.readyState === 1) { ws.send(str); return true; }
     if (ws && ws.readyState === 0) {
       // 连接中：先缓存，onopen 后自动补发
@@ -837,6 +926,16 @@
       readyBtn.textContent = '等待另一名玩家…';
     }
 
+    // 自测台：两人到齐后自动点「准备」（?auto=1 或 ?host=1），免去人工点击
+    if (two && (autoPlay || autoHost) && !autoReadySent) {
+      var meP = null;
+      for (var q = 0; q < m.players.length; q++) if (m.players[q].role === m.role) meP = m.players[q];
+      if (meP && !meP.ready) {
+        autoReadySent = true;
+        setTimeout(function () { netSend({ type: 'ready' }); }, 500);
+      }
+    }
+
     var hint = $('lobbyHint');
     var hostNote = (netKind === 'mqtt' && window.MQTTNet && window.MQTTNet.isHost())
       ? '<div class="hostNote">房主模式：对局中请保持本页面在前台（切到其它标签页/最小化会让双方都变卡）</div>'
@@ -856,12 +955,13 @@
 
   function createRoom() {
     var name = setNameOfInput();
-    // 公网静态部署（如 GitHub Pages）用公共中继；本地/局域网用自建服务器
-    if (!isLocalHost() && window.MQTTNet) {
+    // 公网静态部署（如 GitHub Pages）用公共中继；本地/局域网用自建服务器。
+    // ?net=mqtt 可在本地也强制走公共中继（自测用，复现与线上完全相同的代码路径）
+    if ((forceMqtt() || !isLocalHost()) && window.MQTTNet) {
       netKind = 'mqtt';
       netTip('正在连接公共中继…', '');
       startHostKeepAlive(); // 房主：防止切后台被浏览器降频
-      window.MQTTNet.create(name, onServerMsg, onNetStatus);
+      window.MQTTNet.create(name, onMsgFromNet, onNetStatus);
       return;
     }
     netKind = 'ws';
@@ -873,10 +973,10 @@
     var code = $('roomIn').value.trim().toUpperCase();
     if (!code) { showToast('请输入房间号'); return; }
     var name = setNameOfInput();
-    if (!isLocalHost() && window.MQTTNet) {
+    if ((forceMqtt() || !isLocalHost()) && window.MQTTNet) {
       netKind = 'mqtt';
       netTip('正在连接公共中继…', '');
-      window.MQTTNet.join(code, name, onServerMsg, onNetStatus);
+      window.MQTTNet.join(code, name, onMsgFromNet, onNetStatus);
       return;
     }
     netKind = 'ws';
@@ -1495,6 +1595,10 @@
 
     updateNetStat(now);
 
+    // 自测台：自动代打（?auto=1）。必须放在"上报输入"之前，
+    // 这样上报给权威端的、以及本地预测用的，都是代打产生的输入。
+    if (autoPlay && mode === 'online' && inPlay) autoInput();
+
     // 上报输入用 30Hz（33ms）：权威端更快知道你按了什么，对手看你才不"慢半拍"
     if (mode === 'online' && inPlay && netKind === 'mqtt' && now - lastSendT > 33) {
       lastSendT = now;
@@ -1622,6 +1726,7 @@
     lastPhase = '';
     lastPhaseT = -1;
     practiceGame = null;
+    autoReadySent = false;
     try {
       var cv = $('game');
       var ctx = cv.getContext('2d');
@@ -1665,7 +1770,14 @@
 
   function copyInvite() {
     var code = $('roomCode').textContent.trim();
-    var url = location.origin + location.pathname + '?room=' + encodeURIComponent(code);
+    // 自测参数一并带上：把链接粘到"第二个窗口"时，两边条件完全一致
+    var qs = new URLSearchParams(location.search);
+    var extra = '';
+    ['net', 'lag', 'auto'].forEach(function (k) {
+      var v = qs.get(k);
+      if (v) extra += '&' + k + '=' + encodeURIComponent(v);
+    });
+    var url = location.origin + location.pathname + '?room=' + encodeURIComponent(code) + extra;
     function done(ok) {
       showToast(ok ? '邀请链接已复制，朋友打开即可直接进入房间 ' + code : '复制失败，请手动发送房间号 ' + code, 3600);
     }
@@ -1729,7 +1841,7 @@
     var roomParam = qs.get('room');
     if (roomParam) $('roomIn').value = roomParam.toUpperCase();
 
-    if (isLocalHost()) {
+    if (isLocalHost() && !forceMqtt()) {
       // 本地/局域网：连自建服务器
       connect();
     } else {
@@ -1738,9 +1850,24 @@
       if (roomParam && window.MQTTNet) {
         setTimeout(function () {
           netKind = 'mqtt';
-          window.MQTTNet.join(roomParam.trim().toUpperCase(), setNameOfInput(), onServerMsg, onNetStatus);
+          window.MQTTNet.join(roomParam.trim().toUpperCase(), setNameOfInput(), onMsgFromNet, onNetStatus);
         }, 300);
       }
+    }
+
+    // 自测台状态提示：明确区分"模拟环境"与"真实对局"，避免把模拟当故障
+    var stTags = [];
+    if (NET.on) stTags.push('网络模拟（' + netSimDesc() + '）');
+    if (autoPlay) stTags.push('自动代打');
+    if (forceMqtt()) stTags.push('强制走公共中继');
+    if (stTags.length) {
+      netTip('自测模式：' + stTags.join(' + ') + '（去掉网址里的这类参数即恢复真实对局）', 'ok');
+      showToast('已开启自测模式：' + stTags.join(' + '), 5200);
+    }
+    // 自测台：自动建房（?host=1，用于"零点击"起一局）。
+    // 注意：本地访问要连公共中继需再加 ?net=mqtt，否则会走自建服务器那条路。
+    if (autoHost && !roomParam) {
+      setTimeout(function () { createRoom(); }, 700);
     }
 
     requestAnimationFrame(function (t) { lastT = t; requestAnimationFrame(frame); });
