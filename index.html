@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>球影对决 - 双人弓箭对决</title>
-  <link rel="stylesheet" href="style.css?v=2609110533" />
+  <link rel="stylesheet" href="style.css?v=2609110542" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%23ef4444'/><circle cx='34' cy='38' r='7' fill='white'/><circle cx='36' cy='39' r='3.5' fill='%231e293b'/><circle cx='66' cy='38' r='7' fill='white'/><circle cx='64' cy='39' r='3.5' fill='%231e293b'/></svg>" />
 </head>
 <body>
@@ -75,6 +75,9 @@
         鼠标 —— 瞄准　按住<kbd>左键</kbd> —— 连续射箭<br />
         <kbd>右键</kbd> —— 射出一发极快的<b>必杀箭</b>（命中即击倒，冷却 3 秒）<br />
         箭壶共 <b>5</b> 支，打空后需 2 秒一次性装填；命中 <b>5</b> 箭击倒对方（血条=5 发伤害）。
+        <br /><br /><b>联机不顺畅？</b>先做一次
+        <a href="net-check.html" target="_blank" style="color:#2563eb;text-decoration:underline">网络体检（直连自检）</a>
+        —— 只点一下，不用联机，10 秒出结果。
       </div>
     </div>
   </div>
@@ -96,15 +99,15 @@
     </div>
   </div>
 
-  <script src="engine.js?v=2609110533"></script>
-  <script src="render.js?v=2609110533"></script>
+  <script src="engine.js?v=2609110542"></script>
+  <script src="render.js?v=2609110542"></script>
   <!-- 公共中继联机：mqtt.js 已放到本站同源目录。
        之前用的是国外 CDN（cdnjs），国内经常卡住/连不上，
        而它是阻塞脚本，会连带让 net-mqtt.js / game.js 都加载不了 → 页面按钮全失效。 -->
-  <script src="mqtt.min.js?v=2609110533"></script>
+  <script src="mqtt.min.js?v=2609110542"></script>
   <!-- 浏览器直连（WebRTC 点对点）：两人之间直接传数据，不经过任何服务器 -->
-  <script src="net-p2p.js?v=2609110533"></script>
-  <script src="net-mqtt.js?v=2609110533"></script>
-  <script src="game.js?v=2609110533"></script>
+  <script src="net-p2p.js?v=2609110542"></script>
+  <script src="net-mqtt.js?v=2609110542"></script>
+  <script src="game.js?v=2609110542"></script>
 </body>
 </html>
