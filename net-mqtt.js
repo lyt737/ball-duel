@@ -169,6 +169,7 @@
     // 对端输入到达间隔统计（用于给房主显示"对方网络抖不抖"）
     this.inGapAvg = 33;
     this.inGapPeak = 33;
+    this.playDelay = 0; // 当前的"远端输入播放延迟"（自适应，用于左上角显示）
   }
 
   HostRoom.prototype.roster = function (forRole) {
@@ -190,6 +191,7 @@
     this.mq = [];
     this.inGapAvg = 33;
     this.inGapPeak = 33;
+    this.playDelay = 0; // 当前的"远端输入播放延迟"（自适应，用于左上角显示）
     var begin = { t: 'begin', names: this.names.slice() };
     this.onMessage(begin); // 本机也要进入对局
     pub(topicOut, begin);
@@ -279,12 +281,14 @@
   };
 
   // 【防自动攻击】输入超时保护：
-  // 某一端如果 450ms 没有任何输入上报（切后台、掉线、卡住、鼠标状态残留），
+  // 某一端如果长时间没有任何输入上报（切后台、掉线、卡住、鼠标状态残留），
   // 就把它清零。否则 fire=true 会一直挂着，表现成"没人按键却一直射"。
+  // 阈值放宽到 1200ms：公共中继偶发 400ms 级别的停顿很常见，
+  // 阈值太小会把正常抖动当成掉线，把房员的球"一刀切停"（这也是一卡一跳的来源）。
   HostRoom.prototype.expireInputs = function (now) {
     for (var i = 0; i < 2; i++) {
       var inp = this.inputs[i];
-      if (!inp.t || now - inp.t <= 450) continue;
+      if (!inp.t || now - inp.t <= 1200) continue;
       inp.fire = false;
       inp.boost = false;
       inp.snipe = false;
@@ -296,10 +300,14 @@
     }
   };
 
-  // 从抖动缓冲里取出"延迟 REMOTE_INPUT_DELAY 之前那一格"的移动键
+  // 从抖动缓冲里取出"延迟 delay 之前那一格"的移动键。
+  // delay 按实测抖动自适应：网络越抖 → 延迟越大（用延迟换平滑），
+  // 上限 300ms，避免房员的操作变得太迟钝。
   HostRoom.prototype.pickRemoteKeys = function (now) {
     if (!this.mq.length) return;
-    var want = now - REMOTE_INPUT_DELAY;
+    var delay = Math.max(REMOTE_INPUT_DELAY, Math.min(300, this.inGapPeak * 0.8));
+    this.playDelay = delay;
+    var want = now - delay;
     var chosen = null, idx = -1;
     for (var i = this.mq.length - 1; i >= 0; i--) {
       if (this.mq[i].t <= want) { chosen = this.mq[i]; idx = i; break; }
@@ -377,7 +385,7 @@
     // 房主用：对端输入到达间隔统计（峰值越大 = 对方网络越抖）
     stats: function () {
       if (!isHost || !hostRoom) return null;
-      return { inGapAvg: hostRoom.inGapAvg, inGapPeak: hostRoom.inGapPeak };
+      return { inGapAvg: hostRoom.inGapAvg, inGapPeak: hostRoom.inGapPeak, playDelay: hostRoom.playDelay || 0 };
     },
 
     create: function (name, onMessage, onStatus) {
