@@ -116,6 +116,24 @@
       /^192\.168\./.test(h) || /^10\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
   }
 
+  /* ---------- 版本标记 ----------
+   * 部署脚本会在给 game.js 的地址加上 ?v=时间戳，这里把它读出来、
+   * 显示在左上角状态条和主菜单上 —— 以后任何截图都能一眼确认
+   * "你跑的是哪一版代码"，不会再出现"改了、但你看的是旧缓存"的扯皮。 */
+  var BUILD = (function () {
+    try {
+      var s = (document.currentScript && document.currentScript.src) || '';
+      var m = /[?&]v=([^&]+)/.exec(s);
+      if (m) return m[1];
+      var all = document.getElementsByTagName('script');
+      for (var i = 0; i < all.length; i++) {
+        var mm = /game\.js\?v=([^&]+)/.exec(all[i].src || '');
+        if (mm) return mm[1];
+      }
+    } catch (e) {}
+    return 'dev';
+  })();
+
   /* =========================================================
    *   自测台（全部挂在网址参数上，正常游玩不受任何影响）
    *   ?lag=120,60,2   网络模拟：单程延迟 120ms、抖动 ±60ms、丢包 2%
@@ -253,7 +271,8 @@
       var pcls = maxMs < 24 ? 'ok' : (maxMs < 40 ? 'mid' : 'bad');
       el.className = 'netStat ' + pcls;
       el.textContent = '本机帧率 ' + fps + ' · 最慢帧 ' + Math.round(maxMs) + 'ms' +
-        '\n判定：' + (pcls === 'ok' ? '本机流畅' : (pcls === 'mid' ? '偶尔顿一下（轻微）' : '本机卡顿明显'));
+        '\n判定：' + (pcls === 'ok' ? '本机流畅' : (pcls === 'mid' ? '偶尔顿一下（轻微）' : '本机卡顿明显')) +
+        '\n版本 ' + BUILD;
       return;
     }
 
@@ -269,7 +288,8 @@
       var vd = j < 80 ? '对方网络良好' : (j < 200 ? '对方网络一般（已自动加大输入缓冲）' : '对方网络很差（中继拥堵）');
       el.className = 'netStat ' + (j < 80 ? 'ok' : (j < 200 ? 'mid' : 'bad'));
       el.textContent = head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
-        '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd;
+        '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd +
+        '\n版本 ' + BUILD;
     } else if (!clkReady) {
       el.className = 'netStat mid';
       el.textContent = head + '正在测量网络…';
@@ -281,7 +301,7 @@
       el.textContent = head +
         '抖动 ' + jj + 'ms · 间隔 ' + Math.round(snapGapMs) + '/' + Math.round(snapGapPeak) + 'ms' +
         '\n外推 ' + ex + ' / ' + fr + ' 帧 · 画面延迟 ' + Math.round(playoutMs) + 'ms' +
-        '\n判定：' + verdict;
+        '\n判定：' + verdict + '\n版本 ' + BUILD;
     }
   }
 
@@ -964,19 +984,33 @@
       hint.innerHTML = '将房间号 <b style="letter-spacing:2px">' + m.code + '</b> 或邀请链接发给朋友。<br/>对方加入后，双方点「准备」即可开战。' + hostNote;
     }
 
-    // 自测台：把"带全部参数的完整链接"直接显示出来。
-    // 复制到第二个窗口打开，两边条件才完全一致（少复制参数会导致一边没开模拟）。
+    // 自测台：一键打开"第二个测试窗口"。
+    // 用带尺寸参数的 window.open → 浏览器会开成独立窗口（而不是标签页），
+    // 这一步很关键：隐藏的标签页会被浏览器限流，导致对方显示"对手掉线了"。
     if (NET.on || autoPlay || autoHost || forceMqtt()) {
       var qs2 = new URLSearchParams(location.search);
       var ex2 = '';
       ['net', 'lag', 'auto'].forEach(function (kk) { // 注意：不带 host，第二个窗口不能自己建房
         var vv = qs2.get(kk);
-        if (vv) ex2 += '&amp;' + kk + '=' + encodeURIComponent(vv);
+        if (vv) ex2 += '&' + kk + '=' + encodeURIComponent(vv);
       });
-      hint.innerHTML += '<div style="margin-top:10px;font-size:12px;line-height:1.7;text-align:left;' +
-        'word-break:break-all;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:10px">' +
-        '<b>自测台已开启。</b>把下面这一整行复制到<b>第二个窗口</b>打开（两个窗口都必须带参数）：<br/>' +
-        '<b>' + esc(location.origin + location.pathname + '?room=' + m.code + ex2) + '</b></div>';
+      var rigUrl = location.origin + location.pathname + '?room=' + m.code + ex2;
+      var rigW = Math.max(520, Math.floor((screen.width - 60) / 2));
+      var rigH = Math.max(420, Math.floor(screen.height * 0.78));
+      hint.innerHTML += '<div style="margin-top:10px;font-size:12px;line-height:1.9;text-align:left;' +
+        'background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px">' +
+        '<b>⚠️ 自测必须用两个"独立窗口"</b>：两个标签页一定失败 —— 隐藏的标签会被浏览器限流，' +
+        '对方会显示"对手掉线了"。<br/>' +
+        '<button id="btnRig2" style="margin:8px 0;padding:9px 16px;border-radius:8px;border:0;' +
+        'background:#fb923c;color:#fff;font-weight:700;cursor:pointer">① 一键打开第二个测试窗口</button><br/>' +
+        '② 把两个窗口并排摆好、<b>都别最小化</b>，就会自动开打（不用点准备）。<br/>' +
+        '<span style="opacity:.75;word-break:break-all">若按钮被浏览器拦截，手动复制这行到新窗口打开：<br/>' +
+        esc(rigUrl) + '</span></div>';
+      var b2 = $('btnRig2');
+      if (b2) b2.onclick = function () {
+        window.open(rigUrl, '_blank',
+          'width=' + rigW + ',height=' + rigH + ',left=' + (screen.width - rigW - 20) + ',top=30');
+      };
     }
     // 关键：对局进行中收到大厅刷新（如对方重试 join）时，绝不能把玩家踢回大厅界面。
     // 反过来，只要还没拿到对局数据（lastSnap 为空），就必须切到房间界面，
@@ -1888,6 +1922,11 @@
     updateSndBtn();
     installBackGuard();
     showScreen('menu');
+    // 主菜单上显示版本号：开打之前就能确认浏览器加载的是哪一版代码
+    try {
+      var helpEl = document.querySelector('.help');
+      if (helpEl) helpEl.innerHTML += '<br /><span style="opacity:.55">版本 ' + BUILD + '</span>';
+    } catch (e) {}
 
     // 房主切后台会让双方卡：回到前台时提醒
     var hiddenDuringPlay = false;
