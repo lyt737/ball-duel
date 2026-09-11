@@ -512,6 +512,7 @@
     attach: attach,
     resize: resize,
     toWorld: toWorld,
+    toScreen: toScreen,
     frame: frame,
     processEvents: processEvents,
     // 本地即时开火反馈：按下瞬间在枪口冒火光，不必等服务器快照
