@@ -293,8 +293,11 @@
     // 随便一张截图就能判断卡在哪一步（候选地址数量 / 超时 / 被占用…）。
     var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
     if (window.P2PNet) {
-      if (window.P2PNet.state() === 'open') head = '直连（点对点）\n';
-      else {
+      if (window.P2PNet.state() === 'open') {
+        var pInf0 = window.P2PNet.info();
+        // 经 TURN 中转也显示出来 —— 别把"中转"当成"直连"，延迟差很多
+        head = (pInf0 && pInf0.path === 'turn') ? '中转（免费 TURN）\n' : '直连（点对点）\n';
+      } else {
         var pInf = window.P2PNet.info();
         if (pInf && pInf.detail) head += '直连未成功：' + pInf.detail + '\n';
       }
