@@ -48,9 +48,12 @@
   var sigSend = null, peerCb = null, stCb = null;
   var state = 'idle';   // idle | trying | open | failed | closed
   var timeoutTimer = null, retryTimer = null;
-  var started = false, attempt = 0, cand = 0;
+  var started = false, attempt = 0, cand = 0, candMax = 0;
+  // 每次重建连接对象都 +1：用来忽略"上一代连接迟到的回调"。
+  // 之前没做这个，导致旧通道的 onclose 把失败原因误报成"直连断开"，把真原因盖掉了。
+  var gen = 0;
   // 最近一次"定论"（成功/失败原因），常驻显示在左上角状态条里，
-  // 这样不抓瞬时提示也能看出直连为什么没成（候选 0 = STUN 被挡；有候选 = 打洞失败）
+  // 这样不抓瞬时提示也能看出直连为什么没成（候选 0 = 地址收集被挡；有候选 = 打洞失败）
   var lastInfo = '';
   var pathKind = ''; // 'p2p'（真正的点对点）| 'turn'（经免费 TURN 中转）
 
@@ -103,29 +106,31 @@
     } catch (e) {}
   }
 
-  function wire(channel) {
+  function wire(channel, my) {
     dc = channel;
     dc.onopen = function () {
+      if (my !== gen) return; // 上一代连接的回调，忽略
       clearTimeout(timeoutTimer); timeoutTimer = null;
       clearTimeout(retryTimer); retryTimer = null;
       status('open');
       // 等 1.2 秒让候选配对稳定下来，再判断走的是哪条路
-      setTimeout(detectPath, 1200);
+      setTimeout(function () { if (my === gen) detectPath(); }, 1200);
     };
     dc.onmessage = function (ev) {
-      if (!peerCb) return;
+      if (my !== gen || !peerCb) return;
       var m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
       peerCb(m);
     };
-    dc.onclose = function () { if (state !== 'closed') fail('直连断开'); };
-    dc.onerror = function () { if (state !== 'open') fail('通道出错'); };
+    dc.onclose = function () { if (my !== gen) return; if (state !== 'closed') fail('直连断开'); };
+    dc.onerror = function () { if (my !== gen) return; if (state !== 'open') fail('通道出错'); };
   }
 
   // 失败处理：房主负责自动重试一次；重试还失败才真正认输（切回中继）
   function fail(reason) {
     if (state === 'open' || state === 'failed') return;
-    var info = reason + '（候选 ' + cand + '）';
+    // 报告"历代尝试里收集到的最多地址数"，避免重试清零后误报成 0
+    var info = reason + '（候选 ' + Math.max(cand, candMax) + '）';
     if (host && attempt < MAX_TRY) {
       attempt++;
       if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
@@ -141,40 +146,46 @@
   function begin() {
     if (!supported()) { status('failed', '浏览器不支持直连'); return; }
     if (disabled()) { status('failed', '已手动关闭直连'); return; }
+    gen++;
+    var my = gen;
     // 重建连接对象（重试时也走这里）
     try { if (dc) dc.close(); } catch (e) {}
     try { if (pc) pc.close(); } catch (e) {}
-    dc = null; cand = 0;
+    dc = null;
+    candMax = Math.max(candMax, cand);
+    cand = 0;
     try {
       pc = new window.RTCPeerConnection({ iceServers: ICE, iceCandidatePoolSize: 2 });
     } catch (e) {
       status('failed', '直连初始化失败');
       return;
     }
-    pc.onicecandidate = function (e) { if (e && e.candidate) cand++; };
+    pc.onicecandidate = function (e) { if (my !== gen) return; if (e && e.candidate) cand++; };
     pc.onconnectionstatechange = function () {
+      if (my !== gen) return;
       var s = pc && pc.connectionState;
       if (s === 'failed') fail('连接失败');
       else if (s === 'disconnected' && state === 'open') fail('连接中断');
     };
     status('trying');
     if (timeoutTimer) clearTimeout(timeoutTimer);
-    timeoutTimer = setTimeout(function () { fail('超时'); }, TRY_MS);
+    timeoutTimer = setTimeout(function () { if (my === gen) fail('超时'); }, TRY_MS);
 
     if (host) {
       try {
-        wire(pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 }));
+        wire(pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 }), my);
       } catch (e) { fail('通道创建失败'); return; }
       pc.createOffer()
         .then(function (o) { return pc.setLocalDescription(o); })
         .then(function () {
           waitIce(function () {
+            if (my !== gen) return;
             if (pc && pc.localDescription && sigSend) sigSend({ t: 'rtcOff', sdp: pc.localDescription.sdp });
           });
         })
-        .catch(function () { fail('发起失败'); });
+        .catch(function () { if (my === gen) fail('发起失败'); });
     } else {
-      pc.ondatachannel = function (e) { wire(e.channel); };
+      pc.ondatachannel = function (e) { if (my !== gen) return; wire(e.channel, my); };
     }
   }
 
@@ -198,21 +209,24 @@
       // 房主重试会再发一次 offer：这时必须重建连接对象
       if (state === 'failed' || state === 'closed' || (pc && pc.remoteDescription)) begin();
       if (!pc) return true;
+      var my = gen;
       pc.setRemoteDescription({ type: 'offer', sdp: m.sdp })
         .then(function () { return pc.createAnswer(); })
         .then(function (a) { return pc.setLocalDescription(a); })
         .then(function () {
           waitIce(function () {
+            if (my !== gen) return;
             if (pc && pc.localDescription && sigSend) sigSend({ t: 'rtcAns', sdp: pc.localDescription.sdp });
           });
         })
-        .catch(function () { fail('协商失败'); });
+        .catch(function () { if (my === gen) fail('协商失败'); });
       return true;
     }
     // rtcAns
     if (!host || !pc) return true;
+    var myA = gen;
     pc.setRemoteDescription({ type: 'answer', sdp: m.sdp })
-      .catch(function () { fail('协商失败'); });
+      .catch(function () { if (myA === gen) fail('协商失败'); });
     return true;
   }
 
