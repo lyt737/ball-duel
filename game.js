@@ -288,9 +288,17 @@
       return;
     }
 
+    // 左上角第一行：当前走的是"直连"还是"中继"。
+    // 直连没成功时，把失败原因【常驻显示】出来 —— 不用抓瞬时提示，
+    // 随便一张截图就能判断卡在哪一步（候选地址数量 / 超时 / 被占用…）。
     var head = (netKind === 'mqtt' && brokerName) ? '中继 ' + brokerName + '\n' : '';
-    // 直连成功时明确显示出来 —— 这才代表"数据没走中继"
-    if (window.P2PNet && window.P2PNet.state() === 'open') head = '直连（点对点）\n';
+    if (window.P2PNet) {
+      if (window.P2PNet.state() === 'open') head = '直连（点对点）\n';
+      else {
+        var pInf = window.P2PNet.info();
+        if (pInf && pInf.detail) head += '直连未成功：' + pInf.detail + '\n';
+      }
+    }
     var ex = extrapN; extrapN = 0;   // 每 0.5 秒汇报一次，理想是 0
     var fr = frameN; frameN = 0;
 
@@ -310,7 +318,6 @@
       else if (j < 200) vd = '对方网络一般（已自动加大输入缓冲）';
       else vd = '对方网络很差（中继拥堵）';
       el.className = 'netStat ' + (j < 80 ? 'ok' : (j < 200 ? 'mid' : 'bad'));
-      if (p2pOn) head = '直连（点对点）\n';
       el.textContent = simTag + head + '对方抖动 ' + j + 'ms · 输入缓冲 ' + pd + 'ms' +
         '\n我方广播间隔 ' + Math.round(snapGapMs) + 'ms\n判定：' + vd +
         '\n版本 ' + BUILD;
